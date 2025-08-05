@@ -182,11 +182,12 @@ def create_chart_with_hierarchical_controls(fig, full_data, chart_key):
         showlegend=True,
         legend=dict(
             orientation="h",
-            yanchor="bottom",
-            y=1.02,
+            yanchor="top",
+            y=-0.15,
             xanchor="center",
             x=0.5
         ),
+        margin=dict(b=80),
         xaxis=dict(
             rangeselector=dict(
                 buttons=list([
@@ -704,6 +705,455 @@ def aggregate_weekly_data(table):
     
     return weekly_data
 
+def apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment):
+    """Apply budget scenario adjustments to the forecast table - ensures Prophet regressor columns are updated"""
+    scenario_table = table.copy()
+    
+    # Apply adjustments to future periods only
+    future_mask = scenario_table["actual_orders"].isna()
+    
+    # Prophet model uses brand_cost and nonbrand_cost as regressors, so we MUST have these columns
+    # If they don't exist, create them from available cost data
+    if 'brand_cost' not in scenario_table.columns or 'nonbrand_cost' not in scenario_table.columns:
+        # Determine which cost column to use as basis
+        cost_col = None
+        if 'planned_cost' in scenario_table.columns:
+            cost_col = 'planned_cost'
+        elif 'cost' in scenario_table.columns:
+            cost_col = 'cost'
+        
+        if cost_col is not None:
+            # Calculate brand share from historical data if possible
+            hist_data = scenario_table[scenario_table["actual_orders"].notna()]
+            if len(hist_data) > 0 and 'brand_cost' in hist_data.columns and 'nonbrand_cost' in hist_data.columns:
+                # Use actual historical brand share
+                total_brand_hist = hist_data['brand_cost'].sum()
+                total_nonbrand_hist = hist_data['nonbrand_cost'].sum()
+                total_hist = total_brand_hist + total_nonbrand_hist
+                brand_share = total_brand_hist / total_hist if total_hist > 0 else 0.7
+            else:
+                # Default assumption: 70% brand, 30% non-brand
+                brand_share = 0.7
+            
+            # Create the columns for entire dataset
+            scenario_table['brand_cost'] = scenario_table[cost_col] * brand_share
+            scenario_table['nonbrand_cost'] = scenario_table[cost_col] * (1 - brand_share)
+        else:
+            # If no cost data available, create zero columns (forecast will fail but won't crash)
+            scenario_table['brand_cost'] = 0
+            scenario_table['nonbrand_cost'] = 0
+    
+    # Apply adjustments to the Prophet regressor columns (this is the key fix!)
+    if brand_adjustment != 0:
+        scenario_table.loc[future_mask, 'brand_cost'] *= (1 + brand_adjustment / 100)
+    
+    if nonbrand_adjustment != 0:
+        scenario_table.loc[future_mask, 'nonbrand_cost'] *= (1 + nonbrand_adjustment / 100)
+    
+    # Update other cost columns to maintain consistency
+    if 'brand_cost' in scenario_table.columns and 'nonbrand_cost' in scenario_table.columns:
+        new_total_cost = scenario_table.loc[future_mask, 'brand_cost'] + scenario_table.loc[future_mask, 'nonbrand_cost']
+        
+        # Update all cost tracking columns
+        if 'cost' in scenario_table.columns:
+            scenario_table.loc[future_mask, 'cost'] = new_total_cost
+        if 'planned_cost' in scenario_table.columns:
+            scenario_table.loc[future_mask, 'planned_cost'] = new_total_cost
+    
+    return scenario_table
+
+def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30):
+    """Calculate brand vs non-brand elasticities from historical data with recency weighting"""
+    
+    # Get historical data only
+    hist_data = table[table["actual_orders"].notna()].copy()
+    
+    if len(hist_data) < 10:  # Need sufficient data points
+        # Return default elasticities if insufficient data
+        return {
+            'brand_elasticity': 0.15,      # Brand typically has higher elasticity
+            'nonbrand_elasticity': 0.08,   # Non-brand typically lower elasticity  
+            'brand_share': 0.7,            # Assume brand is 70% of spend
+            'baseline_orders_per_brand_dollar': 0.02,
+            'baseline_orders_per_nonbrand_dollar': 0.01,
+            'recency_weighted': False
+        }
+    
+    # Sort by date and calculate recency weights
+    hist_data = hist_data.sort_values('ds')
+    latest_date = hist_data['ds'].max()
+    
+    # Calculate days back from latest date
+    hist_data['days_back'] = (latest_date - hist_data['ds']).dt.days
+    
+    # Exponential decay weighting: weight = exp(-days_back * ln(2) / half_life)
+    # This gives 50% weight at half_life days back, 25% at 2x half_life, etc.
+    hist_data['recency_weight'] = np.exp(-hist_data['days_back'] * np.log(2) / decay_half_life)
+    
+    # Additional boost for very recent data (last recency_days)
+    recent_boost = 1.5  # 50% boost for recent data
+    hist_data.loc[hist_data['days_back'] <= recency_days, 'recency_weight'] *= recent_boost
+    
+    # Normalize weights so they sum to original data length (maintains scale)
+    total_weight = hist_data['recency_weight'].sum()
+    if total_weight > 0:
+        hist_data['recency_weight'] = hist_data['recency_weight'] * len(hist_data) / total_weight
+    
+    # Calculate weighted correlations and elasticities
+    elasticities = {}
+    
+    def weighted_correlation(x, y, weights):
+        """Calculate weighted correlation coefficient"""
+        if len(x) < 2 or weights.sum() == 0:
+            return 0
+        
+        # Weighted means
+        wx = np.average(x, weights=weights)
+        wy = np.average(y, weights=weights)
+        
+        # Weighted covariance and variances
+        cov = np.average((x - wx) * (y - wy), weights=weights)
+        var_x = np.average((x - wx) ** 2, weights=weights)
+        var_y = np.average((y - wy) ** 2, weights=weights)
+        
+        if var_x <= 0 or var_y <= 0:
+            return 0
+        
+        return cov / np.sqrt(var_x * var_y)
+    
+    # Brand elasticity calculation with recency weighting
+    if 'brand_cost' in hist_data.columns and hist_data['brand_cost'].var() > 0:
+        # Use separate brand_cost column if available
+        brand_corr = weighted_correlation(
+            hist_data['brand_cost'].values,
+            hist_data['actual_orders'].values,
+            hist_data['recency_weight'].values
+        )
+        
+        # Debug: Add fallback to simple correlation if weighted fails
+        if brand_corr == 0 or np.isnan(brand_corr):
+            brand_corr_simple = hist_data['brand_cost'].corr(hist_data['actual_orders'])
+            brand_corr = brand_corr_simple if not np.isnan(brand_corr_simple) else 0
+        
+        brand_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
+        brand_mean_cost = np.average(hist_data['brand_cost'], weights=hist_data['recency_weight'])
+        
+        if brand_mean_orders > 0 and brand_mean_cost > 0:
+            brand_elasticity = abs(brand_corr) * 0.22
+            elasticities['baseline_orders_per_brand_dollar'] = brand_mean_orders / brand_mean_cost
+        else:
+            brand_elasticity = 0.15
+            elasticities['baseline_orders_per_brand_dollar'] = 0.02
+        
+        # Debug info
+        elasticities['debug_brand_corr'] = brand_corr
+        elasticities['debug_brand_mean_orders'] = brand_mean_orders
+        elasticities['debug_brand_mean_cost'] = brand_mean_cost
+    elif 'cost' in hist_data.columns and hist_data['cost'].var() > 0:
+        # Fallback: use total cost as proxy for brand cost correlation
+        total_cost_corr = weighted_correlation(
+            hist_data['cost'].values,
+            hist_data['actual_orders'].values,
+            hist_data['recency_weight'].values
+        )
+        total_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
+        total_mean_cost = np.average(hist_data['cost'], weights=hist_data['recency_weight'])
+        
+        if total_mean_orders > 0 and total_mean_cost > 0:
+            # Brand is typically more elastic than total, so boost the correlation
+            brand_elasticity = abs(total_cost_corr) * 0.28  # Higher multiplier for brand
+            elasticities['baseline_orders_per_brand_dollar'] = total_mean_orders / total_mean_cost
+        else:
+            brand_elasticity = 0.15
+            elasticities['baseline_orders_per_brand_dollar'] = 0.02
+    else:
+        brand_elasticity = 0.15
+        elasticities['baseline_orders_per_brand_dollar'] = 0.02
+    
+    # Non-brand elasticity calculation with recency weighting
+    if 'nonbrand_cost' in hist_data.columns and hist_data['nonbrand_cost'].var() > 0:
+        # Use separate nonbrand_cost column if available
+        nonbrand_corr = weighted_correlation(
+            hist_data['nonbrand_cost'].values,
+            hist_data['actual_orders'].values,
+            hist_data['recency_weight'].values
+        )
+        
+        # Debug: Add fallback to simple correlation if weighted fails
+        if nonbrand_corr == 0 or np.isnan(nonbrand_corr):
+            nonbrand_corr_simple = hist_data['nonbrand_cost'].corr(hist_data['actual_orders'])
+            nonbrand_corr = nonbrand_corr_simple if not np.isnan(nonbrand_corr_simple) else 0
+        
+        nonbrand_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
+        nonbrand_mean_cost = np.average(hist_data['nonbrand_cost'], weights=hist_data['recency_weight'])
+        
+        if nonbrand_mean_orders > 0 and nonbrand_mean_cost > 0:
+            nonbrand_elasticity = abs(nonbrand_corr) * 0.17
+            elasticities['baseline_orders_per_nonbrand_dollar'] = nonbrand_mean_orders / nonbrand_mean_cost
+        else:
+            nonbrand_elasticity = 0.08
+            elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
+        
+        # Debug info
+        elasticities['debug_nonbrand_corr'] = nonbrand_corr
+        elasticities['debug_nonbrand_mean_orders'] = nonbrand_mean_orders
+        elasticities['debug_nonbrand_mean_cost'] = nonbrand_mean_cost
+    elif 'cost' in hist_data.columns and hist_data['cost'].var() > 0:
+        # Fallback: use total cost as proxy for nonbrand cost correlation  
+        total_cost_corr = weighted_correlation(
+            hist_data['cost'].values,
+            hist_data['actual_orders'].values,
+            hist_data['recency_weight'].values
+        )
+        total_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
+        total_mean_cost = np.average(hist_data['cost'], weights=hist_data['recency_weight'])
+        
+        if total_mean_orders > 0 and total_mean_cost > 0:
+            # Non-brand is typically less elastic than total
+            nonbrand_elasticity = abs(total_cost_corr) * 0.15  # Lower multiplier for non-brand
+            elasticities['baseline_orders_per_nonbrand_dollar'] = total_mean_orders / total_mean_cost
+        else:
+            nonbrand_elasticity = 0.08
+            elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
+    else:
+        nonbrand_elasticity = 0.08
+        elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
+    
+    # Calculate weighted brand share
+    if 'brand_cost' in hist_data.columns and 'nonbrand_cost' in hist_data.columns:
+        weighted_brand = np.average(hist_data['brand_cost'], weights=hist_data['recency_weight'])
+        weighted_nonbrand = np.average(hist_data['nonbrand_cost'], weights=hist_data['recency_weight'])
+        total_weighted_spend = weighted_brand + weighted_nonbrand
+        brand_share = weighted_brand / total_weighted_spend if total_weighted_spend > 0 else 0.7
+    else:
+        brand_share = 0.7  # Default assumption
+    
+    # Calculate recency statistics for debugging
+    recent_data_points = len(hist_data[hist_data['days_back'] <= recency_days])
+    avg_weight_recent = hist_data[hist_data['days_back'] <= recency_days]['recency_weight'].mean() if recent_data_points > 0 else 0
+    avg_weight_old = hist_data[hist_data['days_back'] > decay_half_life]['recency_weight'].mean() if len(hist_data[hist_data['days_back'] > decay_half_life]) > 0 else 0
+    
+    elasticities.update({
+        'brand_elasticity': max(0.05, min(0.35, brand_elasticity)),  # Slightly higher cap due to recency focus
+        'nonbrand_elasticity': max(0.02, min(0.25, nonbrand_elasticity)),  # Slightly higher cap due to recency focus
+        'brand_share': brand_share,
+        'recency_weighted': True,
+        'recent_data_points': recent_data_points,
+        'avg_weight_recent': avg_weight_recent,
+        'avg_weight_old': avg_weight_old,
+        'recency_days': recency_days,
+        'decay_half_life': decay_half_life
+    })
+    
+    return elasticities
+
+def calculate_incremental_impact(baseline_table, scenario_table, elasticities):
+    """Calculate incremental impact using elasticity curves with diminishing returns"""
+    
+    baseline_future = baseline_table[baseline_table["actual_orders"].isna()].copy()
+    scenario_future = scenario_table[scenario_table["actual_orders"].isna()].copy()
+    
+    if baseline_future.empty or scenario_future.empty:
+        return 1.0, {}
+    
+    # CRITICAL FIX: Ensure baseline table has brand_cost and nonbrand_cost columns
+    # The baseline table may not have these columns in future periods, so create them
+    if 'brand_cost' not in baseline_future.columns or baseline_future['brand_cost'].sum() == 0:
+        # Use the same logic as apply_budget_scenario to create baseline brand/nonbrand costs
+        cost_col = None
+        if 'planned_cost' in baseline_future.columns:
+            cost_col = 'planned_cost'
+        elif 'cost' in baseline_future.columns:
+            cost_col = 'cost'
+        
+        if cost_col is not None:
+            # Use historical brand share or default
+            brand_share = elasticities.get('brand_share', 0.7)
+            baseline_future['brand_cost'] = baseline_future[cost_col] * brand_share
+            baseline_future['nonbrand_cost'] = baseline_future[cost_col] * (1 - brand_share)
+    
+    # Calculate spend changes
+    brand_baseline = baseline_future['brand_cost'].sum() if 'brand_cost' in baseline_future.columns else 0
+    brand_scenario = scenario_future['brand_cost'].sum() if 'brand_cost' in scenario_future.columns else 0
+    
+    nonbrand_baseline = baseline_future['nonbrand_cost'].sum() if 'nonbrand_cost' in baseline_future.columns else 0
+    nonbrand_scenario = scenario_future['nonbrand_cost'].sum() if 'nonbrand_cost' in scenario_future.columns else 0
+    
+    # Calculate absolute spend changes
+    brand_change = brand_scenario - brand_baseline
+    nonbrand_change = nonbrand_scenario - nonbrand_baseline
+    
+    # Apply diminishing returns curve: impact = elasticity * ln(1 + % change)
+    brand_impact = 0
+    nonbrand_impact = 0
+    
+    if brand_baseline > 0 and brand_change != 0:
+        brand_pct_change = brand_change / brand_baseline
+        # Diminishing returns: use log function to model saturation
+        if brand_pct_change > 0:
+            log_term = np.log(1 + brand_pct_change)
+            brand_impact = elasticities['brand_elasticity'] * log_term
+        else:
+            # For decreases, use linear relationship (no saturation effect)
+            brand_impact = elasticities['brand_elasticity'] * brand_pct_change
+    
+    if nonbrand_baseline > 0 and nonbrand_change != 0:
+        nonbrand_pct_change = nonbrand_change / nonbrand_baseline
+        if nonbrand_pct_change > 0:
+            log_term_nb = np.log(1 + nonbrand_pct_change)
+            nonbrand_impact = elasticities['nonbrand_elasticity'] * log_term_nb
+        else:
+            nonbrand_impact = elasticities['nonbrand_elasticity'] * nonbrand_pct_change
+    
+    # Total multiplicative impact (1 + impact)
+    total_impact_factor = 1 + brand_impact + nonbrand_impact
+    
+    impact_details = {
+        'brand_spend_change': brand_change,
+        'nonbrand_spend_change': nonbrand_change,
+        'brand_impact_pct': brand_impact * 100,
+        'nonbrand_impact_pct': nonbrand_impact * 100,
+        'total_impact_factor': total_impact_factor,
+        'brand_baseline': brand_baseline,
+        'nonbrand_baseline': nonbrand_baseline,
+        # Add debugging details
+        'brand_elasticity_used': elasticities.get('brand_elasticity', 0),
+        'nonbrand_elasticity_used': elasticities.get('nonbrand_elasticity', 0),
+        'brand_pct_change': brand_change / brand_baseline if brand_baseline > 0 else 0,
+        'nonbrand_pct_change': nonbrand_change / nonbrand_baseline if nonbrand_baseline > 0 else 0,
+        'raw_brand_impact': brand_impact,
+        'raw_nonbrand_impact': nonbrand_impact,
+        # Additional debug info
+        'brand_log_term': np.log(1 + brand_change / brand_baseline) if brand_baseline > 0 and brand_change > 0 else 0,
+        'nonbrand_log_term': np.log(1 + nonbrand_change / nonbrand_baseline) if nonbrand_baseline > 0 and nonbrand_change > 0 else 0,
+        'sum_impacts': brand_impact + nonbrand_impact,
+        # Debug the baseline creation
+        'debug_baseline_had_brand_cost': 'brand_cost' in baseline_table[baseline_table["actual_orders"].isna()].columns,
+        'debug_baseline_brand_sum_original': baseline_table[baseline_table["actual_orders"].isna()]['brand_cost'].sum() if 'brand_cost' in baseline_table[baseline_table["actual_orders"].isna()].columns else 'N/A'
+    }
+    
+    return total_impact_factor, impact_details
+
+def generate_scenario_forecast(scenario_table, baseline_table=None):
+    """Generate new forecasts using sophisticated elasticity-based modeling"""
+    
+    # Get future data from scenario table
+    future_data = scenario_table[scenario_table["actual_orders"].isna()].copy()
+    
+    if future_data.empty or baseline_table is None:
+        return None, None, None, {}
+    
+    # Calculate historical elasticities
+    elasticities = calculate_historical_elasticities(baseline_table)
+    
+    # Calculate incremental impact with diminishing returns
+    impact_factor, impact_details = calculate_incremental_impact(baseline_table, scenario_table, elasticities)
+    
+    # Apply impact to baseline forecasts - use baseline forecast as starting point
+    baseline_future = baseline_table[baseline_table["actual_orders"].isna()].copy()
+    scenario_orders_fc = baseline_future[['ds']].copy()
+    
+    if 'orders' in baseline_future.columns and len(baseline_future) > 0:
+        # Apply elasticity-based impact factor to baseline forecast
+        scenario_orders_fc['orders'] = baseline_future['orders'] * impact_factor
+        
+        # Add confidence intervals if they exist in baseline
+        if 'orders_upper' in baseline_future.columns:
+            scenario_orders_fc['orders_upper'] = baseline_future['orders_upper'] * impact_factor
+        if 'orders_lower' in baseline_future.columns:
+            scenario_orders_fc['orders_lower'] = baseline_future['orders_lower'] * impact_factor
+    else:
+        scenario_orders_fc['orders'] = 0
+    
+    # Clicks and impressions respond differently - they're more directly tied to spend
+    clicks_impact = 1 + (impact_factor - 1) * 0.9  # 90% of orders impact
+    impressions_impact = 1 + (impact_factor - 1) * 1.1  # 110% of orders impact (more responsive)
+    
+    scenario_clicks_fc = baseline_future[['ds']].copy()
+    if 'clicks' in baseline_future.columns and len(baseline_future) > 0:
+        scenario_clicks_fc['clicks'] = baseline_future['clicks'] * clicks_impact
+        
+        # Add confidence intervals if they exist
+        if 'clicks_upper' in baseline_future.columns:
+            scenario_clicks_fc['clicks_upper'] = baseline_future['clicks_upper'] * clicks_impact
+        if 'clicks_lower' in baseline_future.columns:
+            scenario_clicks_fc['clicks_lower'] = baseline_future['clicks_lower'] * clicks_impact
+    else:
+        scenario_clicks_fc['clicks'] = 0
+    
+    scenario_impr_fc = baseline_future[['ds']].copy()
+    if 'impressions' in baseline_future.columns and len(baseline_future) > 0:
+        scenario_impr_fc['impressions'] = baseline_future['impressions'] * impressions_impact
+        
+        # Add confidence intervals if they exist
+        if 'impressions_upper' in baseline_future.columns:
+            scenario_impr_fc['impressions_upper'] = baseline_future['impressions_upper'] * impressions_impact
+        if 'impressions_lower' in baseline_future.columns:
+            scenario_impr_fc['impressions_lower'] = baseline_future['impressions_lower'] * impressions_impact
+    else:
+        scenario_impr_fc['impressions'] = 0
+    
+    scenario_metrics = {
+        'total_orders': scenario_orders_fc['orders'].sum(),
+        'impact_factor': impact_factor,
+        'elasticities': elasticities,
+        'impact_details': impact_details
+    }
+    
+    return scenario_orders_fc, scenario_clicks_fc, scenario_impr_fc, scenario_metrics
+
+def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_orders_fc, scenario_orders_fc):
+    """Create comparison chart between baseline and scenario forecasts"""
+    fig = go.Figure()
+    
+    # Historical data (same for both)
+    hist_data = baseline_table[baseline_table["actual_orders"].notna()]
+    if not hist_data.empty:
+        fig.add_trace(go.Scatter(
+            x=hist_data["ds"],
+            y=hist_data["actual_orders"],
+            mode='lines+markers',
+            name='Historical Orders',
+            line=dict(color='black', width=2)
+        ))
+    
+    # Baseline forecast
+    if baseline_orders_fc is not None and not baseline_orders_fc.empty:
+        fig.add_trace(go.Scatter(
+            x=baseline_orders_fc["ds"],
+            y=baseline_orders_fc["orders"],
+            mode='lines+markers',
+            name='Baseline Forecast',
+            line=dict(color='blue', width=2)
+        ))
+    
+    # Scenario forecast
+    if scenario_orders_fc is not None and not scenario_orders_fc.empty:
+        fig.add_trace(go.Scatter(
+            x=scenario_orders_fc["ds"],
+            y=scenario_orders_fc["orders"],
+            mode='lines+markers',
+            name='Scenario Forecast',
+            line=dict(color='red', width=2, dash='dash')
+        ))
+    
+    fig.update_layout(
+        title="Baseline vs Scenario Forecast Comparison",
+        xaxis_title="Date",
+        yaxis_title="Orders",
+        hovermode='x unified',
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5
+        ),
+        margin=dict(b=80)
+    )
+    
+    return fig
+
 def create_weekly_forecast_charts(weekly_table, title_suffix="Weekly"):
     """Create weekly forecast charts"""
     
@@ -928,7 +1378,7 @@ if uploaded_file is not None:
             metrics = calculate_summary_metrics(table)
             
             # Create tabs for different views
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 Daily Dashboard", "📅 Weekly Dashboard", "📋 Data Tables", "📈 Advanced Analytics"])
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Daily Dashboard", "📅 Weekly Dashboard", "📋 Data Tables", "🔮 Scenario Planning", "📈 Advanced Analytics"])
             
             with tab1:
                 st.header("Daily Forecast Dashboard")
@@ -965,11 +1415,8 @@ if uploaded_file is not None:
                 # Display charts
                 st.plotly_chart(fig_orders, use_container_width=True, key="orders_chart")
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.plotly_chart(fig_clicks, use_container_width=True, key="clicks_chart")
-                with col2:
-                    st.plotly_chart(fig_impressions, use_container_width=True, key="impressions_chart")
+                st.plotly_chart(fig_clicks, use_container_width=True, key="clicks_chart")
+                st.plotly_chart(fig_impressions, use_container_width=True, key="impressions_chart")
                 
                 # Add hierarchical trendline info box
                 st.success("🎯 **Hierarchical Dynamic Trendlines**: \n1️⃣ **Date Range Boxes** set the base data range \n2️⃣ **Quick Buttons** (30D, 3M) override to show recent trends \n3️⃣ **Range Slider** provides the most specific filtering - drag to see trends for any window!")
@@ -1009,11 +1456,8 @@ if uploaded_file is not None:
                 
                 st.plotly_chart(fig_orders_weekly, use_container_width=True, key="weekly_orders_chart")
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.plotly_chart(fig_clicks_weekly, use_container_width=True, key="weekly_clicks_chart")
-                with col2:
-                    st.plotly_chart(fig_impressions_weekly, use_container_width=True, key="weekly_impressions_chart")
+                st.plotly_chart(fig_clicks_weekly, use_container_width=True, key="weekly_clicks_chart")
+                st.plotly_chart(fig_impressions_weekly, use_container_width=True, key="weekly_impressions_chart")
                 
                 # Add weekly hierarchical trendline info
                 st.success("🎯 **Weekly Hierarchical Trendlines**: Use Date Range → Quick Buttons → Range Slider for progressively more specific trend analysis!")
@@ -1086,7 +1530,252 @@ if uploaded_file is not None:
                 )
             
             with tab4:
-                st.header("Advanced Analytics")
+                st.header("🔮 Scenario Planning")
+                
+                st.markdown("**What-if Analysis**: Adjust budget scenarios to see forecast impact")
+                
+                with st.expander("📖 Methodology"):
+                    st.markdown("""
+                    **Sophisticated Elasticity-Based Modeling with Recency Weighting:**
+                    
+                    1. **Historical Analysis**: Calculates separate elasticities for brand vs non-brand spend based on your historical data
+                    2. **Recency Weighting**: Recent performance is weighted more heavily:
+                       - Last 14 days get 50% boost in importance
+                       - Exponential decay with 30-day half-life (data loses 50% weight every 30 days)
+                       - This ensures recent market conditions drive predictions vs old patterns
+                    3. **Differential Impact**: Brand and non-brand changes have different impacts based on:
+                       - Weighted historical correlation with orders
+                       - Relative spend share in your recent budget mix
+                       - Different elasticity coefficients
+                    4. **Diminishing Returns**: Uses logarithmic curves for spend increases (no diminishing effect for decreases)
+                    5. **Incremental Modeling**: Applies `elasticity × ln(1 + % change)` for realistic impact calculation
+                    
+                    This approach prioritizes recent performance patterns while accounting for differential channel efficiency.
+                    """)
+                
+                # Scenario controls
+                st.subheader("Budget Adjustment Scenarios")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    brand_adjustment = st.slider(
+                        "Brand Budget Change (%)", 
+                        min_value=-50, max_value=100, value=0, step=5,
+                        help="Adjust brand budget by percentage"
+                    )
+                with col2:
+                    nonbrand_adjustment = st.slider(
+                        "Non-Brand Budget Change (%)", 
+                        min_value=-50, max_value=100, value=0, step=5,
+                        help="Adjust non-brand budget by percentage"
+                    )
+                
+                # Apply scenario if adjustments are made
+                if brand_adjustment != 0 or nonbrand_adjustment != 0:
+                    scenario_table = apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment)
+                    
+                    # Generate scenario forecasts - pass baseline table for comparison
+                    scenario_orders_fc, scenario_clicks_fc, scenario_impr_fc, scenario_metrics = generate_scenario_forecast(
+                        scenario_table, table
+                    )
+                    
+                    # Enhanced debug information showing elasticity analysis - Always visible for troubleshooting
+                    st.subheader("🔍 Elasticity Analysis & Debug")
+                    if True:  # Temporarily always show debug info
+                        st.write("**Available columns in data:**", list(table.columns))
+                        future_data = table[table["actual_orders"].isna()]
+                        st.write(f"**Future periods found:** {len(future_data)} days")
+                        
+                        # Debug scenario calculations
+                        st.write("**Scenario Debug:**")
+                        st.write(f"Brand adjustment: {brand_adjustment}%")
+                        st.write(f"Non-brand adjustment: {nonbrand_adjustment}%")
+                        st.write("**Prophet Model Uses:** brand_cost, nonbrand_cost, promo_flag, clicks, impressions")
+                        
+                        # Check if adjustments were applied
+                        baseline_future = table[table["actual_orders"].isna()]
+                        scenario_future_debug = scenario_table[scenario_table["actual_orders"].isna()]
+                        
+                        if len(baseline_future) > 0 and len(scenario_future_debug) > 0:
+                            for col in ['brand_cost', 'nonbrand_cost', 'cost', 'planned_cost']:
+                                if col in baseline_future.columns:
+                                    baseline_sum = baseline_future[col].sum()
+                                    scenario_sum = scenario_future_debug[col].sum()
+                                    change = scenario_sum - baseline_sum
+                                    st.write(f"- {col}: ${baseline_sum:,.0f} → ${scenario_sum:,.0f} (${change:+,.0f})")
+                        
+                        # Check orders calculation
+                        baseline_orders_sum = baseline_future['orders'].sum() if 'orders' in baseline_future.columns else 0
+                        scenario_orders_sum = scenario_orders_fc['orders'].sum() if scenario_orders_fc is not None else 0
+                        orders_change = scenario_orders_sum - baseline_orders_sum
+                        st.write(f"**Orders Forecast:**")
+                        st.write(f"- Baseline: {baseline_orders_sum:,.0f} orders")
+                        st.write(f"- Scenario: {scenario_orders_sum:,.0f} orders")
+                        st.write(f"- Incremental: {orders_change:+,.0f} orders")
+                        if baseline_orders_sum > 0:
+                            percent_change = (orders_change / baseline_orders_sum) * 100
+                            st.write(f"- % Change: {percent_change:+.1f}%")
+                        
+                        # Show impact factor calculation
+                        impact_factor = scenario_metrics.get('impact_factor', 1.0)
+                        st.write(f"**Impact Factor Applied: {impact_factor:.3f}**")
+                        if impact_factor == 1.0:
+                            st.error("⚠️ Impact factor is 1.0 - no incremental effect calculated!")
+                            st.write("This usually means:")
+                            st.write("- No cost changes were detected")
+                            st.write("- Elasticity calculations returned zero")
+                            st.write("- Brand/non-brand columns are missing or empty")
+                        else:
+                            st.success(f"✅ Impact factor calculated: {impact_factor:.3f} ({(impact_factor-1)*100:+.1f}% change)")
+                        
+                        # Show elasticity calculations
+                        if 'elasticities' in scenario_metrics:
+                            elasticities = scenario_metrics['elasticities']
+                            
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Brand Elasticity", f"{elasticities['brand_elasticity']:.1%}")
+                                st.metric("Brand Share", f"{elasticities['brand_share']:.1%}")
+                                if 'debug_brand_corr' in elasticities:
+                                    st.write(f"Brand correlation: {elasticities['debug_brand_corr']:.3f}")
+                            with col2:
+                                st.metric("Non-Brand Elasticity", f"{elasticities['nonbrand_elasticity']:.1%}")
+                                st.metric("Non-Brand Share", f"{(1-elasticities['brand_share']):.1%}")
+                                if 'debug_nonbrand_corr' in elasticities:
+                                    st.write(f"Non-brand correlation: {elasticities['debug_nonbrand_corr']:.3f}")
+                            with col3:
+                                st.metric("Elasticity Ratio", f"{elasticities['brand_elasticity']/elasticities['nonbrand_elasticity']:.1f}x")
+                                
+                            # Show detailed correlation debug
+                            if 'debug_brand_corr' in elasticities:
+                                st.write("**Correlation Debug:**")
+                                st.write(f"- Brand: {elasticities['debug_brand_corr']:.4f} correlation → {elasticities['brand_elasticity']:.4f} elasticity")
+                                st.write(f"- Non-brand: {elasticities['debug_nonbrand_corr']:.4f} correlation → {elasticities['nonbrand_elasticity']:.4f} elasticity")
+                                
+                            # Show recency weighting info if available
+                            if elasticities.get('recency_weighted', False):
+                                st.write("**📅 Recency Weighting Applied:**")
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.write(f"Recent data points (≤{elasticities['recency_days']}d): {elasticities['recent_data_points']}")
+                                with col2:
+                                    st.write(f"Avg weight (recent): {elasticities['avg_weight_recent']:.1f}")
+                                with col3:
+                                    st.write(f"Avg weight (old): {elasticities['avg_weight_old']:.1f}")
+                                
+                                st.write(f"Decay half-life: {elasticities['decay_half_life']} days (50% weight reduction)")
+                            else:
+                                st.info("Using default elasticities (insufficient historical data)")
+                            
+                            # Show impact details if available
+                            if 'impact_details' in scenario_metrics:
+                                details = scenario_metrics['impact_details']
+                                st.write("**Spend Change Analysis:**")
+                                
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.write(f"- Brand baseline: ${details['brand_baseline']:,.0f}")
+                                    st.write(f"- Brand change: ${details['brand_spend_change']:+,.0f}")
+                                    st.write(f"- Brand % change: {details['brand_pct_change']:+.1%}")
+                                    st.write(f"- Brand elasticity: {details['brand_elasticity_used']:.3f}")
+                                    st.write(f"- Raw brand impact: {details['raw_brand_impact']:+.4f}")
+                                    st.write(f"- Brand impact: {details['brand_impact_pct']:+.1f}%")
+                                with col2:
+                                    st.write(f"- Non-brand baseline: ${details['nonbrand_baseline']:,.0f}")
+                                    st.write(f"- Non-brand change: ${details['nonbrand_spend_change']:+,.0f}")
+                                    st.write(f"- Non-brand % change: {details['nonbrand_pct_change']:+.1%}")
+                                    st.write(f"- Non-brand elasticity: {details['nonbrand_elasticity_used']:.3f}")
+                                    st.write(f"- Raw non-brand impact: {details['raw_nonbrand_impact']:+.4f}")
+                                    st.write(f"- Non-brand impact: {details['nonbrand_impact_pct']:+.1f}%")
+                                
+                                st.write(f"**Total Impact Factor:** {details['total_impact_factor']:.3f} ({(details['total_impact_factor']-1)*100:+.1f}%)")
+                                
+                                # Show the math breakdown
+                                st.write("**Impact Calculation Breakdown:**")
+                                st.write(f"- Brand: {details['brand_elasticity_used']:.4f} × ln(1+{details['brand_pct_change']:.3f}) = {details['brand_elasticity_used']:.4f} × {details['brand_log_term']:.4f} = {details['raw_brand_impact']:.4f}")
+                                st.write(f"- Non-brand: {details['nonbrand_elasticity_used']:.4f} × ln(1+{details['nonbrand_pct_change']:.3f}) = {details['nonbrand_elasticity_used']:.4f} × {details['nonbrand_log_term']:.4f} = {details['raw_nonbrand_impact']:.4f}")
+                                st.write(f"- Sum of impacts: {details['sum_impacts']:.4f}")
+                                st.write(f"- Final factor: 1 + {details['sum_impacts']:.4f} = {details['total_impact_factor']:.4f}")
+                                
+                                # Highlight the problem if elasticities are zero
+                                if details['brand_elasticity_used'] == 0 and details['nonbrand_elasticity_used'] == 0:
+                                    st.error("🚨 Both elasticities are ZERO! This means no historical correlation was found between spend and orders.")
+                                elif details['brand_elasticity_used'] == 0:
+                                    st.warning("⚠️ Brand elasticity is ZERO - no historical correlation found.")  
+                                elif details['nonbrand_elasticity_used'] == 0:
+                                    st.warning("⚠️ Non-brand elasticity is ZERO - no historical correlation found.")
+                                elif details['sum_impacts'] == 0:
+                                    st.error("🚨 Sum of impacts is ZERO despite non-zero elasticities! Check the calculation logic.")
+                                    st.write(f"Debug: Baseline had brand_cost: {details.get('debug_baseline_had_brand_cost', 'Unknown')}")
+                                    st.write(f"Debug: Original baseline brand sum: {details.get('debug_baseline_brand_sum_original', 'Unknown')}")
+                    
+                    # Display scenario comparison
+                    st.subheader("📊 Scenario vs Baseline Comparison")
+                    
+                    # Create comparison chart
+                    scenario_comparison_chart = create_scenario_comparison_chart(
+                        table, scenario_table, orders_fc, scenario_orders_fc
+                    )
+                    st.plotly_chart(scenario_comparison_chart, use_container_width=True)
+                    
+                    # Scenario metrics comparison
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        baseline_total = orders_fc['orders'].sum() if orders_fc is not None else 0
+                        scenario_total = scenario_orders_fc['orders'].sum() if scenario_orders_fc is not None else 0
+                        impact = scenario_total - baseline_total
+                        st.metric(
+                            "Orders Impact", 
+                            f"{impact:+,.0f}",
+                            delta=f"{(impact/baseline_total*100):+.1f}%" if baseline_total > 0 else "N/A"
+                        )
+                    
+                    with col2:
+                        # Get future data for both scenarios
+                        last_actual = table[table['actual_orders'].notna()]['ds'].max()  
+                        baseline_future = table[table['ds'] > last_actual] if not pd.isna(last_actual) else table[table['actual_orders'].isna()]
+                        scenario_future = scenario_table[scenario_table['ds'] > last_actual] if not pd.isna(last_actual) else scenario_table[scenario_table['actual_orders'].isna()]
+                        
+                        # Calculate costs using the best available cost column
+                        def get_total_cost(df):
+                            if 'planned_cost' in df.columns and df['planned_cost'].notna().any():
+                                return df['planned_cost'].sum()
+                            elif 'cost' in df.columns and df['cost'].notna().any():
+                                return df['cost'].sum()
+                            elif 'brand_cost' in df.columns and 'nonbrand_cost' in df.columns:
+                                return df['brand_cost'].fillna(0).sum() + df['nonbrand_cost'].fillna(0).sum()
+                            else:
+                                return 0
+                        
+                        baseline_cost = get_total_cost(baseline_future)
+                        scenario_cost = get_total_cost(scenario_future)
+                        cost_impact = scenario_cost - baseline_cost
+                        
+                        st.metric(
+                            "Cost Impact", 
+                            f"${cost_impact:+,.0f}",
+                            delta=f"{(cost_impact/baseline_cost*100):+.1f}%" if baseline_cost > 0 else "N/A"
+                        )
+                    
+                    with col3:
+                        if baseline_cost > 0 and scenario_cost > 0 and baseline_total > 0 and scenario_total > 0:
+                            baseline_cpa = baseline_cost / baseline_total
+                            scenario_cpa = scenario_cost / scenario_total
+                            cpa_impact = scenario_cpa - baseline_cpa
+                            st.metric(
+                                "CPA Impact", 
+                                f"${cpa_impact:+.2f}",
+                                delta=f"{(cpa_impact/baseline_cpa*100):+.1f}%" if baseline_cpa > 0 else "N/A"
+                            )
+                        else:
+                            st.metric("CPA Impact", "N/A", help="Insufficient data for CPA calculation")
+                
+                else:
+                    st.info("👆 Adjust the budget sliders above to see scenario forecasts")
+            
+            with tab5:
+                st.header("📈 Advanced Analytics")
                 
                 # Performance metrics
                 if metrics:
