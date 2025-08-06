@@ -762,8 +762,8 @@ def apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment):
     
     return scenario_table
 
-def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30):
-    """Calculate brand vs non-brand elasticities from historical data with recency weighting"""
+def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30, confidence_level=0.9, n_bootstrap=1000):
+    """Calculate brand vs non-brand elasticities from historical data with recency weighting and confidence intervals"""
     
     # Get historical data only
     hist_data = table[table["actual_orders"].notna()].copy()
@@ -776,7 +776,8 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
             'brand_share': 0.7,            # Assume brand is 70% of spend
             'baseline_orders_per_brand_dollar': 0.02,
             'baseline_orders_per_nonbrand_dollar': 0.01,
-            'recency_weighted': False
+            'recency_weighted': False,
+            'confidence_intervals': False
         }
     
     # Sort by date and calculate recency weights
@@ -821,13 +822,60 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
         
         return cov / np.sqrt(var_x * var_y)
     
-    # Brand elasticity calculation with recency weighting
+    def bootstrap_elasticity(cost_data, orders_data, weights, n_bootstrap=1000):
+        """Calculate bootstrap confidence intervals for elasticity"""
+        if len(cost_data) < 10 or cost_data.var() == 0:
+            return 0, 0, 0  # elasticity, lower_ci, upper_ci
+        
+        elasticities = []
+        n_samples = len(cost_data)
+        
+        for _ in range(n_bootstrap):
+            # Bootstrap sample with replacement
+            indices = np.random.choice(n_samples, size=n_samples, replace=True)
+            
+            # Sample data and weights
+            boot_cost = cost_data.iloc[indices].values
+            boot_orders = orders_data.iloc[indices].values  
+            boot_weights = weights.iloc[indices].values
+            
+            # Calculate correlation for this bootstrap sample
+            corr = weighted_correlation(boot_cost, boot_orders, boot_weights)
+            
+            # Convert to elasticity (same logic as main calculation)
+            if 'brand' in str(cost_data.name).lower():
+                elasticity = abs(corr) * 0.22  # Brand multiplier
+            else:
+                elasticity = abs(corr) * 0.17  # Non-brand multiplier
+            
+            elasticities.append(elasticity)
+        
+        elasticities = np.array(elasticities)
+        
+        # Calculate confidence intervals
+        alpha = 1 - confidence_level
+        lower_percentile = (alpha / 2) * 100
+        upper_percentile = (1 - alpha / 2) * 100
+        
+        lower_ci = np.percentile(elasticities, lower_percentile)
+        upper_ci = np.percentile(elasticities, upper_percentile)
+        mean_elasticity = np.mean(elasticities)
+        
+        return mean_elasticity, lower_ci, upper_ci
+    
+    # Brand elasticity calculation with recency weighting and confidence intervals
     if 'brand_cost' in hist_data.columns and hist_data['brand_cost'].var() > 0:
         # Use separate brand_cost column if available
         brand_corr = weighted_correlation(
             hist_data['brand_cost'].values,
             hist_data['actual_orders'].values,
             hist_data['recency_weight'].values
+        )
+        
+        # Calculate bootstrap confidence intervals
+        hist_data['brand_cost'].name = 'brand_cost'  # Ensure name is set for bootstrap function
+        brand_elasticity_boot, brand_lower_ci, brand_upper_ci = bootstrap_elasticity(
+            hist_data['brand_cost'], hist_data['actual_orders'], hist_data['recency_weight'], n_bootstrap
         )
         
         # Debug: Add fallback to simple correlation if weighted fails
@@ -844,6 +892,12 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
         else:
             brand_elasticity = 0.15
             elasticities['baseline_orders_per_brand_dollar'] = 0.02
+            brand_lower_ci = 0.05
+            brand_upper_ci = 0.25
+        
+        # Store confidence intervals
+        elasticities['brand_elasticity_lower_ci'] = brand_lower_ci
+        elasticities['brand_elasticity_upper_ci'] = brand_upper_ci
         
         # Debug info
         elasticities['debug_brand_corr'] = brand_corr
@@ -856,6 +910,13 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
             hist_data['actual_orders'].values,
             hist_data['recency_weight'].values
         )
+        
+        # Bootstrap for total cost (proxy for brand)
+        hist_data['cost'].name = 'total_cost'
+        _, total_lower_ci, total_upper_ci = bootstrap_elasticity(
+            hist_data['cost'], hist_data['actual_orders'], hist_data['recency_weight'], n_bootstrap
+        )
+        
         total_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
         total_mean_cost = np.average(hist_data['cost'], weights=hist_data['recency_weight'])
         
@@ -863,20 +924,33 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
             # Brand is typically more elastic than total, so boost the correlation
             brand_elasticity = abs(total_cost_corr) * 0.28  # Higher multiplier for brand
             elasticities['baseline_orders_per_brand_dollar'] = total_mean_orders / total_mean_cost
+            # Adjust confidence intervals for brand (higher than total cost)
+            elasticities['brand_elasticity_lower_ci'] = total_lower_ci * 1.2
+            elasticities['brand_elasticity_upper_ci'] = total_upper_ci * 1.2
         else:
             brand_elasticity = 0.15
             elasticities['baseline_orders_per_brand_dollar'] = 0.02
+            elasticities['brand_elasticity_lower_ci'] = 0.05
+            elasticities['brand_elasticity_upper_ci'] = 0.25
     else:
         brand_elasticity = 0.15
         elasticities['baseline_orders_per_brand_dollar'] = 0.02
+        elasticities['brand_elasticity_lower_ci'] = 0.05
+        elasticities['brand_elasticity_upper_ci'] = 0.25
     
-    # Non-brand elasticity calculation with recency weighting
+    # Non-brand elasticity calculation with recency weighting and confidence intervals
     if 'nonbrand_cost' in hist_data.columns and hist_data['nonbrand_cost'].var() > 0:
         # Use separate nonbrand_cost column if available
         nonbrand_corr = weighted_correlation(
             hist_data['nonbrand_cost'].values,
             hist_data['actual_orders'].values,
             hist_data['recency_weight'].values
+        )
+        
+        # Calculate bootstrap confidence intervals
+        hist_data['nonbrand_cost'].name = 'nonbrand_cost'
+        nonbrand_elasticity_boot, nonbrand_lower_ci, nonbrand_upper_ci = bootstrap_elasticity(
+            hist_data['nonbrand_cost'], hist_data['actual_orders'], hist_data['recency_weight'], n_bootstrap
         )
         
         # Debug: Add fallback to simple correlation if weighted fails
@@ -893,6 +967,12 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
         else:
             nonbrand_elasticity = 0.08
             elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
+            nonbrand_lower_ci = 0.02
+            nonbrand_upper_ci = 0.15
+        
+        # Store confidence intervals
+        elasticities['nonbrand_elasticity_lower_ci'] = nonbrand_lower_ci
+        elasticities['nonbrand_elasticity_upper_ci'] = nonbrand_upper_ci
         
         # Debug info
         elasticities['debug_nonbrand_corr'] = nonbrand_corr
@@ -905,6 +985,14 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
             hist_data['actual_orders'].values,
             hist_data['recency_weight'].values
         )
+        
+        # Use the same bootstrap results from earlier if available
+        if 'cost' in hist_data.columns:
+            hist_data['cost'].name = 'total_cost_nonbrand'
+            _, total_lower_ci_nb, total_upper_ci_nb = bootstrap_elasticity(
+                hist_data['cost'], hist_data['actual_orders'], hist_data['recency_weight'], n_bootstrap
+            )
+        
         total_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
         total_mean_cost = np.average(hist_data['cost'], weights=hist_data['recency_weight'])
         
@@ -912,12 +1000,19 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
             # Non-brand is typically less elastic than total
             nonbrand_elasticity = abs(total_cost_corr) * 0.15  # Lower multiplier for non-brand
             elasticities['baseline_orders_per_nonbrand_dollar'] = total_mean_orders / total_mean_cost
+            # Adjust confidence intervals for non-brand (lower than total cost)
+            elasticities['nonbrand_elasticity_lower_ci'] = total_lower_ci_nb * 0.8
+            elasticities['nonbrand_elasticity_upper_ci'] = total_upper_ci_nb * 0.8
         else:
             nonbrand_elasticity = 0.08
             elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
+            elasticities['nonbrand_elasticity_lower_ci'] = 0.02
+            elasticities['nonbrand_elasticity_upper_ci'] = 0.15
     else:
         nonbrand_elasticity = 0.08
         elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
+        elasticities['nonbrand_elasticity_lower_ci'] = 0.02
+        elasticities['nonbrand_elasticity_upper_ci'] = 0.15
     
     # Calculate weighted brand share
     if 'brand_cost' in hist_data.columns and 'nonbrand_cost' in hist_data.columns:
@@ -942,19 +1037,21 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
         'avg_weight_recent': avg_weight_recent,
         'avg_weight_old': avg_weight_old,
         'recency_days': recency_days,
-        'decay_half_life': decay_half_life
+        'decay_half_life': decay_half_life,
+        'confidence_intervals': True,
+        'confidence_level': confidence_level
     })
     
     return elasticities
 
 def calculate_incremental_impact(baseline_table, scenario_table, elasticities):
-    """Calculate incremental impact using elasticity curves with diminishing returns"""
+    """Calculate incremental impact using elasticity curves with diminishing returns and confidence intervals"""
     
     baseline_future = baseline_table[baseline_table["actual_orders"].isna()].copy()
     scenario_future = scenario_table[scenario_table["actual_orders"].isna()].copy()
     
     if baseline_future.empty or scenario_future.empty:
-        return 1.0, {}
+        return 1.0, {}, 1.0, 1.0
     
     # CRITICAL FIX: Ensure baseline table has brand_cost and nonbrand_cost columns
     # The baseline table may not have these columns in future periods, so create them
@@ -984,29 +1081,53 @@ def calculate_incremental_impact(baseline_table, scenario_table, elasticities):
     nonbrand_change = nonbrand_scenario - nonbrand_baseline
     
     # Apply diminishing returns curve: impact = elasticity * ln(1 + % change)
+    # Calculate point estimates and confidence intervals
     brand_impact = 0
     nonbrand_impact = 0
+    brand_impact_lower = 0
+    brand_impact_upper = 0
+    nonbrand_impact_lower = 0
+    nonbrand_impact_upper = 0
+    
+    # Get elasticity confidence intervals if available
+    brand_elast = elasticities['brand_elasticity']
+    brand_elast_lower = elasticities.get('brand_elasticity_lower_ci', brand_elast * 0.7)
+    brand_elast_upper = elasticities.get('brand_elasticity_upper_ci', brand_elast * 1.3)
+    
+    nonbrand_elast = elasticities['nonbrand_elasticity']
+    nonbrand_elast_lower = elasticities.get('nonbrand_elasticity_lower_ci', nonbrand_elast * 0.7)
+    nonbrand_elast_upper = elasticities.get('nonbrand_elasticity_upper_ci', nonbrand_elast * 1.3)
     
     if brand_baseline > 0 and brand_change != 0:
         brand_pct_change = brand_change / brand_baseline
         # Diminishing returns: use log function to model saturation
         if brand_pct_change > 0:
             log_term = np.log(1 + brand_pct_change)
-            brand_impact = elasticities['brand_elasticity'] * log_term
+            brand_impact = brand_elast * log_term
+            brand_impact_lower = brand_elast_lower * log_term
+            brand_impact_upper = brand_elast_upper * log_term
         else:
             # For decreases, use linear relationship (no saturation effect)
-            brand_impact = elasticities['brand_elasticity'] * brand_pct_change
+            brand_impact = brand_elast * brand_pct_change
+            brand_impact_lower = brand_elast_lower * brand_pct_change
+            brand_impact_upper = brand_elast_upper * brand_pct_change
     
     if nonbrand_baseline > 0 and nonbrand_change != 0:
         nonbrand_pct_change = nonbrand_change / nonbrand_baseline
         if nonbrand_pct_change > 0:
             log_term_nb = np.log(1 + nonbrand_pct_change)
-            nonbrand_impact = elasticities['nonbrand_elasticity'] * log_term_nb
+            nonbrand_impact = nonbrand_elast * log_term_nb
+            nonbrand_impact_lower = nonbrand_elast_lower * log_term_nb
+            nonbrand_impact_upper = nonbrand_elast_upper * log_term_nb
         else:
-            nonbrand_impact = elasticities['nonbrand_elasticity'] * nonbrand_pct_change
+            nonbrand_impact = nonbrand_elast * nonbrand_pct_change
+            nonbrand_impact_lower = nonbrand_elast_lower * nonbrand_pct_change
+            nonbrand_impact_upper = nonbrand_elast_upper * nonbrand_pct_change
     
-    # Total multiplicative impact (1 + impact)
+    # Total multiplicative impact (1 + impact) - point estimate and confidence intervals
     total_impact_factor = 1 + brand_impact + nonbrand_impact
+    total_impact_factor_lower = 1 + brand_impact_lower + nonbrand_impact_lower
+    total_impact_factor_upper = 1 + brand_impact_upper + nonbrand_impact_upper
     
     impact_details = {
         'brand_spend_change': brand_change,
@@ -1014,11 +1135,22 @@ def calculate_incremental_impact(baseline_table, scenario_table, elasticities):
         'brand_impact_pct': brand_impact * 100,
         'nonbrand_impact_pct': nonbrand_impact * 100,
         'total_impact_factor': total_impact_factor,
+        'total_impact_factor_lower': total_impact_factor_lower,
+        'total_impact_factor_upper': total_impact_factor_upper,
         'brand_baseline': brand_baseline,
         'nonbrand_baseline': nonbrand_baseline,
+        # Confidence interval details
+        'brand_impact_pct_lower': brand_impact_lower * 100,
+        'brand_impact_pct_upper': brand_impact_upper * 100,
+        'nonbrand_impact_pct_lower': nonbrand_impact_lower * 100,
+        'nonbrand_impact_pct_upper': nonbrand_impact_upper * 100,
         # Add debugging details
         'brand_elasticity_used': elasticities.get('brand_elasticity', 0),
         'nonbrand_elasticity_used': elasticities.get('nonbrand_elasticity', 0),
+        'brand_elasticity_lower_ci': brand_elast_lower,
+        'brand_elasticity_upper_ci': brand_elast_upper,
+        'nonbrand_elasticity_lower_ci': nonbrand_elast_lower,
+        'nonbrand_elasticity_upper_ci': nonbrand_elast_upper,
         'brand_pct_change': brand_change / brand_baseline if brand_baseline > 0 else 0,
         'nonbrand_pct_change': nonbrand_change / nonbrand_baseline if nonbrand_baseline > 0 else 0,
         'raw_brand_impact': brand_impact,
@@ -1032,7 +1164,7 @@ def calculate_incremental_impact(baseline_table, scenario_table, elasticities):
         'debug_baseline_brand_sum_original': baseline_table[baseline_table["actual_orders"].isna()]['brand_cost'].sum() if 'brand_cost' in baseline_table[baseline_table["actual_orders"].isna()].columns else 'N/A'
     }
     
-    return total_impact_factor, impact_details
+    return total_impact_factor, impact_details, total_impact_factor_lower, total_impact_factor_upper
 
 def generate_scenario_forecast(scenario_table, baseline_table=None):
     """Generate new forecasts using sophisticated elasticity-based modeling"""
@@ -1046,8 +1178,8 @@ def generate_scenario_forecast(scenario_table, baseline_table=None):
     # Calculate historical elasticities
     elasticities = calculate_historical_elasticities(baseline_table)
     
-    # Calculate incremental impact with diminishing returns
-    impact_factor, impact_details = calculate_incremental_impact(baseline_table, scenario_table, elasticities)
+    # Calculate incremental impact with diminishing returns and confidence intervals
+    impact_factor, impact_details, impact_factor_lower, impact_factor_upper = calculate_incremental_impact(baseline_table, scenario_table, elasticities)
     
     # Apply impact to baseline forecasts - use baseline forecast as starting point
     baseline_future = baseline_table[baseline_table["actual_orders"].isna()].copy()
@@ -1057,13 +1189,27 @@ def generate_scenario_forecast(scenario_table, baseline_table=None):
         # Apply elasticity-based impact factor to baseline forecast
         scenario_orders_fc['orders'] = baseline_future['orders'] * impact_factor
         
-        # Add confidence intervals if they exist in baseline
-        if 'orders_upper' in baseline_future.columns:
-            scenario_orders_fc['orders_upper'] = baseline_future['orders_upper'] * impact_factor
-        if 'orders_lower' in baseline_future.columns:
-            scenario_orders_fc['orders_lower'] = baseline_future['orders_lower'] * impact_factor
+        # Add elasticity confidence intervals
+        scenario_orders_fc['orders_lower_elasticity'] = baseline_future['orders'] * impact_factor_lower
+        scenario_orders_fc['orders_upper_elasticity'] = baseline_future['orders'] * impact_factor_upper
+        
+        # Combine with baseline Prophet confidence intervals if they exist
+        if 'orders_upper' in baseline_future.columns and 'orders_lower' in baseline_future.columns:
+            # Use wider of the two uncertainty sources
+            baseline_lower = baseline_future['orders_lower'] * impact_factor
+            baseline_upper = baseline_future['orders_upper'] * impact_factor
+            
+            # Take the most conservative (widest) bounds
+            scenario_orders_fc['orders_lower'] = np.minimum(baseline_lower, scenario_orders_fc['orders_lower_elasticity'])
+            scenario_orders_fc['orders_upper'] = np.maximum(baseline_upper, scenario_orders_fc['orders_upper_elasticity'])
+        else:
+            # Use only elasticity confidence intervals
+            scenario_orders_fc['orders_lower'] = scenario_orders_fc['orders_lower_elasticity']
+            scenario_orders_fc['orders_upper'] = scenario_orders_fc['orders_upper_elasticity']
     else:
         scenario_orders_fc['orders'] = 0
+        scenario_orders_fc['orders_lower'] = 0
+        scenario_orders_fc['orders_upper'] = 0
     
     # Clicks and impressions respond differently - they're more directly tied to spend
     clicks_impact = 1 + (impact_factor - 1) * 0.9  # 90% of orders impact
@@ -1095,7 +1241,11 @@ def generate_scenario_forecast(scenario_table, baseline_table=None):
     
     scenario_metrics = {
         'total_orders': scenario_orders_fc['orders'].sum(),
+        'total_orders_lower': scenario_orders_fc['orders_lower'].sum() if 'orders_lower' in scenario_orders_fc.columns else 0,
+        'total_orders_upper': scenario_orders_fc['orders_upper'].sum() if 'orders_upper' in scenario_orders_fc.columns else 0,
         'impact_factor': impact_factor,
+        'impact_factor_lower': impact_factor_lower,
+        'impact_factor_upper': impact_factor_upper,
         'elasticities': elasticities,
         'impact_details': impact_details
     }
@@ -1136,6 +1286,27 @@ def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_or
             name='Scenario Forecast',
             line=dict(color='red', width=2, dash='dash')
         ))
+        
+        # Add confidence intervals for scenario forecast if available
+        if 'orders_upper' in scenario_orders_fc.columns and 'orders_lower' in scenario_orders_fc.columns:
+            fig.add_trace(go.Scatter(
+                x=scenario_orders_fc["ds"],
+                y=scenario_orders_fc["orders_upper"],
+                mode='lines',
+                name='Scenario Upper CI',
+                line=dict(width=0),
+                showlegend=False
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=scenario_orders_fc["ds"],
+                y=scenario_orders_fc["orders_lower"],
+                mode='lines',
+                name='Scenario 90% CI',
+                fill='tonexty',
+                fillcolor='rgba(255,0,0,0.2)',
+                line=dict(width=0)
+            ))
     
     fig.update_layout(
         title="Baseline vs Scenario Forecast Comparison",
@@ -1635,16 +1806,26 @@ if uploaded_file is not None:
                             col1, col2, col3 = st.columns(3)
                             with col1:
                                 st.metric("Brand Elasticity", f"{elasticities['brand_elasticity']:.1%}")
+                                if elasticities.get('confidence_intervals', False):
+                                    brand_lower = elasticities.get('brand_elasticity_lower_ci', 0)
+                                    brand_upper = elasticities.get('brand_elasticity_upper_ci', 0)
+                                    st.caption(f"95% CI: [{brand_lower:.1%} - {brand_upper:.1%}]")
                                 st.metric("Brand Share", f"{elasticities['brand_share']:.1%}")
                                 if 'debug_brand_corr' in elasticities:
                                     st.write(f"Brand correlation: {elasticities['debug_brand_corr']:.3f}")
                             with col2:
                                 st.metric("Non-Brand Elasticity", f"{elasticities['nonbrand_elasticity']:.1%}")
+                                if elasticities.get('confidence_intervals', False):
+                                    nonbrand_lower = elasticities.get('nonbrand_elasticity_lower_ci', 0)
+                                    nonbrand_upper = elasticities.get('nonbrand_elasticity_upper_ci', 0)
+                                    st.caption(f"95% CI: [{nonbrand_lower:.1%} - {nonbrand_upper:.1%}]")
                                 st.metric("Non-Brand Share", f"{(1-elasticities['brand_share']):.1%}")
                                 if 'debug_nonbrand_corr' in elasticities:
                                     st.write(f"Non-brand correlation: {elasticities['debug_nonbrand_corr']:.3f}")
                             with col3:
                                 st.metric("Elasticity Ratio", f"{elasticities['brand_elasticity']/elasticities['nonbrand_elasticity']:.1f}x")
+                                if elasticities.get('confidence_intervals', False):
+                                    st.caption(f"Bootstrap CI ({elasticities.get('confidence_level', 0.9)*100:.0f}%)")
                                 
                             # Show detailed correlation debug
                             if 'debug_brand_corr' in elasticities:
@@ -1690,6 +1871,19 @@ if uploaded_file is not None:
                                 
                                 st.write(f"**Total Impact Factor:** {details['total_impact_factor']:.3f} ({(details['total_impact_factor']-1)*100:+.1f}%)")
                                 
+                                # Show confidence intervals for impact factor
+                                if 'total_impact_factor_lower' in details and 'total_impact_factor_upper' in details:
+                                    lower_factor = details['total_impact_factor_lower']
+                                    upper_factor = details['total_impact_factor_upper']
+                                    st.write(f"**Impact Factor 90% CI:** [{lower_factor:.3f} - {upper_factor:.3f}] ({(lower_factor-1)*100:+.1f}% to {(upper_factor-1)*100:+.1f}%)")
+                                    
+                                    # Show impact range in terms of orders
+                                    baseline_total = orders_fc['orders'].sum() if orders_fc is not None else 0
+                                    if baseline_total > 0:
+                                        lower_orders = baseline_total * (lower_factor - 1)
+                                        upper_orders = baseline_total * (upper_factor - 1)
+                                        st.write(f"**Estimated Orders Impact Range:** {lower_orders:+,.0f} to {upper_orders:+,.0f} orders")
+                                
                                 # Show the math breakdown
                                 st.write("**Impact Calculation Breakdown:**")
                                 st.write(f"- Brand: {details['brand_elasticity_used']:.4f} × ln(1+{details['brand_pct_change']:.3f}) = {details['brand_elasticity_used']:.4f} × {details['brand_log_term']:.4f} = {details['raw_brand_impact']:.4f}")
@@ -1725,11 +1919,20 @@ if uploaded_file is not None:
                         baseline_total = orders_fc['orders'].sum() if orders_fc is not None else 0
                         scenario_total = scenario_orders_fc['orders'].sum() if scenario_orders_fc is not None else 0
                         impact = scenario_total - baseline_total
+                        
+                        # Get confidence interval for orders impact
+                        scenario_lower = scenario_metrics.get('total_orders_lower', scenario_total)
+                        scenario_upper = scenario_metrics.get('total_orders_upper', scenario_total)
+                        impact_lower = scenario_lower - baseline_total
+                        impact_upper = scenario_upper - baseline_total
+                        
                         st.metric(
                             "Orders Impact", 
                             f"{impact:+,.0f}",
                             delta=f"{(impact/baseline_total*100):+.1f}%" if baseline_total > 0 else "N/A"
                         )
+                        if scenario_lower != scenario_total or scenario_upper != scenario_total:
+                            st.caption(f"90% CI: [{impact_lower:+,.0f} to {impact_upper:+,.0f}]")
                     
                     with col2:
                         # Get future data for both scenarios
