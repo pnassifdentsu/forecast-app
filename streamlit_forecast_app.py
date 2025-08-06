@@ -705,6 +705,30 @@ def aggregate_weekly_data(table):
     
     return weekly_data
 
+def aggregate_monthly_data(table):
+    """Aggregate daily data to monthly view"""
+    monthly_table = table.copy()
+    
+    # Add month start date
+    monthly_table['month_start'] = monthly_table['ds'].dt.to_period('M').dt.start_time
+    
+    # Sum columns - but handle NaN values properly
+    sum_cols = ['actual_orders', 'orders', 'actual_clicks', 'clicks', 'actual_impressions', 
+                'impressions', 'cost', 'planned_cost', 'orders_lower', 'orders_upper', 
+                'clicks_lower', 'clicks_upper', 'impressions_lower', 'impressions_upper']
+    
+    # Group by month and aggregate
+    monthly_data = monthly_table.groupby('month_start').apply(
+        lambda group: pd.Series({
+            col: group[col].sum() if group[col].notna().any() else np.nan
+            for col in sum_cols if col in group.columns
+        })
+    ).reset_index()
+    
+    monthly_data.rename(columns={'month_start': 'ds'}, inplace=True)
+    
+    return monthly_data
+
 def apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment):
     """Apply budget scenario adjustments to the forecast table - ensures Prophet regressor columns are updated"""
     scenario_table = table.copy()
@@ -1637,7 +1661,7 @@ if uploaded_file is not None:
                 st.header("Forecast Data Tables")
                 
                 # View selector
-                view_type = st.radio("Select View", ["Daily View", "Weekly View"], horizontal=True)
+                view_type = st.radio("Select View", ["Daily View", "Weekly View", "Monthly View"], horizontal=True)
                 
                 if view_type == "Weekly View":
                     # Weekly data table
@@ -1645,13 +1669,49 @@ if uploaded_file is not None:
                     display_table = weekly_table.copy()
                     time_label = "Week Starting"
                     file_suffix = "weekly"
+                elif view_type == "Monthly View":
+                    # Monthly data table
+                    monthly_table = aggregate_monthly_data(table)
+                    display_table = monthly_table.copy()
+                    time_label = "Month Starting"
+                    file_suffix = "monthly"
                 else:
                     # Daily data table
                     display_table = table.copy()
                     time_label = "Date"
                     file_suffix = "daily"
                 
-                # Add filters
+                # Date range selector (applies to all views)
+                if not display_table.empty:
+                    min_date = display_table['ds'].min().date()
+                    max_date = display_table['ds'].max().date()
+                    
+                    st.subheader("📅 Date Range Filter")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        start_date = st.date_input(
+                            "Start Date",
+                            value=min_date,
+                            min_value=min_date,
+                            max_value=max_date
+                        )
+                    
+                    with col2:
+                        end_date = st.date_input(
+                            "End Date",
+                            value=max_date,
+                            min_value=min_date,
+                            max_value=max_date
+                        )
+                    
+                    # Apply date range filter
+                    display_table = display_table[
+                        (display_table['ds'].dt.date >= start_date) & 
+                        (display_table['ds'].dt.date <= end_date)
+                    ]
+                
+                # Data type filters
                 col1, col2 = st.columns(2)
                 with col1:
                     show_historical = st.checkbox("Show Historical Data", value=True)
@@ -1666,10 +1726,13 @@ if uploaded_file is not None:
                 
                 # Format the table for better display
                 display_table = display_table.copy()
-                if view_type == "Weekly View":
-                    display_table["ds"] = display_table["ds"].dt.strftime("%Y-%m-%d (Week Start)")
-                else:
-                    display_table["ds"] = display_table["ds"].dt.strftime("%Y-%m-%d")
+                if not display_table.empty:
+                    if view_type == "Weekly View":
+                        display_table["ds"] = display_table["ds"].dt.strftime("%Y-%m-%d (Week Start)")
+                    elif view_type == "Monthly View":
+                        display_table["ds"] = display_table["ds"].dt.strftime("%Y-%m (Month Start)")
+                    else:
+                        display_table["ds"] = display_table["ds"].dt.strftime("%Y-%m-%d")
                 
                 # Rename ds column for clarity
                 display_table = display_table.rename(columns={"ds": time_label})
