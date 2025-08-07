@@ -1401,7 +1401,7 @@ if uploaded_file is not None:
                 display_table = calculate_marketing_metrics(display_table)
                 
                 # Format cost columns
-                for col in ["cost", "planned_cost"]:
+                for col in ["cost", "planned_cost", "brand_cost", "nonbrand_cost"]:
                     if col in display_table.columns:
                         display_table[col] = display_table[col].apply(
                             lambda x: f"${x:,.0f}" if pd.notnull(x) else ""
