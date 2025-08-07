@@ -213,147 +213,103 @@ def create_chart_with_hierarchical_controls(fig, full_data, chart_key):
     
     return fig
 
-def create_enhanced_forecast_charts(filtered_table, filtered_orders_fc, filtered_clicks_fc, filtered_impr_fc, 
-                                  original_table, original_orders_fc, original_clicks_fc, original_impr_fc):
-    """Create forecast charts with enhanced hierarchical filtering capabilities"""
-    
-    # This approach creates charts with the filtered data but includes information about the full dataset
-    # The user can then use Plotly's built-in controls to further filter within this dataset
+def create_single_forecast_chart(data, metric, forecast_data=None, original_data=None, 
+                               colors={'actual': 'black', 'forecast': 'blue', 'ci': 'rgba(0,100,80,0.2)'}, 
+                               enhanced=False, title_prefix=""):
+    """Create a single forecast chart for any metric"""
+    actual_col = f"actual_{metric}"
+    upper_col = f"{metric}_upper"
+    lower_col = f"{metric}_lower"
     
     # Determine split point
-    last_actual = filtered_table[filtered_table["actual_orders"].notna()]["ds"].max() if not filtered_table[filtered_table["actual_orders"].notna()].empty else None
+    last_actual = data[data[actual_col].notna()]["ds"].max() if not data[data[actual_col].notna()].empty else None
     
-    # Orders Chart
-    fig_orders = go.Figure()
+    fig = go.Figure()
     
     # Historical data
-    hist_data = filtered_table[filtered_table["actual_orders"].notna()]
+    hist_data = data[data[actual_col].notna()]
     if not hist_data.empty:
-        fig_orders.add_trace(go.Scatter(
+        fig.add_trace(go.Scatter(
             x=hist_data["ds"],
-            y=hist_data["actual_orders"],
+            y=hist_data[actual_col],
             mode='lines+markers',
-            name='Actual Orders',
-            line=dict(color='black', width=2)
+            name=f'Actual {metric.title()}',
+            line=dict(color=colors['actual'], width=2)
         ))
     
-    # Forecast data
-    forecast_data = filtered_table[filtered_table["ds"] > last_actual] if last_actual is not None else filtered_table[filtered_table["orders"].notna()]
-    if not forecast_data.empty:
-        fig_orders.add_trace(go.Scatter(
-            x=forecast_data["ds"],
-            y=forecast_data["orders"],
-            mode='lines+markers',  
-            name='Forecast Orders',
-            line=dict(color='blue', width=2)
+    # Forecast data - use separate forecast_data if provided, otherwise use main data
+    if forecast_data is not None and not forecast_data.empty:
+        fc_data = forecast_data
+        fc_col = metric
+    else:
+        fc_data = data[data["ds"] > last_actual] if last_actual is not None else data[data[metric].notna()]
+        fc_col = metric
+    
+    if not fc_data.empty:
+        fig.add_trace(go.Scatter(
+            x=fc_data["ds"],
+            y=fc_data[fc_col],
+            mode='lines+markers',
+            name=f'Forecast {metric.title()}',
+            line=dict(color=colors['forecast'], width=2)
         ))
         
         # Confidence intervals
-        if 'orders_upper' in forecast_data.columns and 'orders_lower' in forecast_data.columns:
-            fig_orders.add_trace(go.Scatter(
-                x=forecast_data["ds"],
-                y=forecast_data["orders_upper"],
+        if upper_col in fc_data.columns and lower_col in fc_data.columns:
+            fig.add_trace(go.Scatter(
+                x=fc_data["ds"],
+                y=fc_data[upper_col],
                 mode='lines',
                 name='Upper CI',
                 line=dict(width=0),
                 showlegend=False
             ))
             
-            fig_orders.add_trace(go.Scatter(
-                x=forecast_data["ds"],
-                y=forecast_data["orders_lower"],
+            fig.add_trace(go.Scatter(
+                x=fc_data["ds"],
+                y=fc_data[lower_col],
                 mode='lines',
                 name='90% Confidence Interval',
                 fill='tonexty',
-                fillcolor='rgba(0,100,80,0.2)',
+                fillcolor=colors['ci'],
                 line=dict(width=0)
             ))
     
-    # Add trendlines for currently filtered data
+    # Add trendlines
     if not hist_data.empty and len(hist_data) >= 2:
-        fig_orders = add_simple_trendline(fig_orders, hist_data["ds"], hist_data["actual_orders"], "Historical Orders", "gray")
-    if not forecast_data.empty and len(forecast_data) >= 2:
-        fig_orders = add_simple_trendline(fig_orders, forecast_data["ds"], forecast_data["orders"], "Forecast Orders", "lightblue")
+        fig = add_simple_trendline(fig, hist_data["ds"], hist_data[actual_col], f"Historical {metric.title()}", "gray")
+    if not fc_data.empty and len(fc_data) >= 2:
+        trendline_color = colors['forecast'].replace('blue', 'lightblue').replace('green', 'lightgreen').replace('red', 'lightcoral')
+        fig = add_simple_trendline(fig, fc_data["ds"], fc_data[fc_col], f"Forecast {metric.title()}", trendline_color)
     
-    # Configure with hierarchical controls
-    fig_orders = create_chart_with_hierarchical_controls(fig_orders, original_table, 'orders')
-    fig_orders.update_layout(
-        title="Orders Forecast with Hierarchical Dynamic Trendlines",
+    # Configure with hierarchical controls if enhanced
+    if enhanced and original_data is not None:
+        fig = create_chart_with_hierarchical_controls(fig, original_data, metric)
+    
+    fig.update_layout(
+        title=f"{title_prefix}{metric.title()} Forecast with Dynamic Trendlines",
         xaxis_title="Date",
-        yaxis_title="Orders",
+        yaxis_title=metric.title(),
         hovermode='x unified'
     )
     
-    # Apply same pattern to other charts
-    # Clicks Chart
-    fig_clicks = go.Figure()
-    hist_clicks = filtered_table[filtered_table["actual_clicks"].notna()]
-    if not hist_clicks.empty:
-        fig_clicks.add_trace(go.Scatter(
-            x=hist_clicks["ds"],
-            y=hist_clicks["actual_clicks"],
-            mode='lines+markers',
-            name='Actual Clicks',
-            line=dict(color='black', width=2)
-        ))
+    return fig
+
+def create_enhanced_forecast_charts(filtered_table, filtered_orders_fc, filtered_clicks_fc, filtered_impr_fc, 
+                                  original_table, original_orders_fc, original_clicks_fc, original_impr_fc):
+    """Create forecast charts with enhanced hierarchical filtering capabilities"""
+    colors_map = {
+        'orders': {'actual': 'black', 'forecast': 'blue', 'ci': 'rgba(0,100,80,0.2)'},
+        'clicks': {'actual': 'black', 'forecast': 'green', 'ci': 'rgba(0,100,80,0.2)'},
+        'impressions': {'actual': 'black', 'forecast': 'red', 'ci': 'rgba(0,100,80,0.2)'}
+    }
     
-    if filtered_clicks_fc is not None and not filtered_clicks_fc.empty:
-        fig_clicks.add_trace(go.Scatter(
-            x=filtered_clicks_fc["ds"],
-            y=filtered_clicks_fc["clicks"],
-            mode='lines+markers',
-            name='Forecast Clicks',
-            line=dict(color='green', width=2)
-        ))
-    
-    # Add trendlines
-    if not hist_clicks.empty and len(hist_clicks) >= 2:
-        fig_clicks = add_simple_trendline(fig_clicks, hist_clicks["ds"], hist_clicks["actual_clicks"], "Historical Clicks", "gray")
-    if filtered_clicks_fc is not None and not filtered_clicks_fc.empty and len(filtered_clicks_fc) >= 2:
-        fig_clicks = add_simple_trendline(fig_clicks, filtered_clicks_fc["ds"], filtered_clicks_fc["clicks"], "Forecast Clicks", "lightgreen")
-    
-    fig_clicks = create_chart_with_hierarchical_controls(fig_clicks, original_clicks_fc, 'clicks')
-    fig_clicks.update_layout(
-        title="Clicks Forecast with Hierarchical Dynamic Trendlines",
-        xaxis_title="Date",
-        yaxis_title="Clicks",
-        hovermode='x unified'
-    )
-    
-    # Impressions Chart
-    fig_impressions = go.Figure()
-    hist_impressions = filtered_table[filtered_table["actual_impressions"].notna()]
-    if not hist_impressions.empty:
-        fig_impressions.add_trace(go.Scatter(
-            x=hist_impressions["ds"],
-            y=hist_impressions["actual_impressions"],
-            mode='lines+markers',
-            name='Actual Impressions',
-            line=dict(color='black', width=2)
-        ))
-    
-    if filtered_impr_fc is not None and not filtered_impr_fc.empty:
-        fig_impressions.add_trace(go.Scatter(
-            x=filtered_impr_fc["ds"],
-            y=filtered_impr_fc["impressions"],
-            mode='lines+markers',
-            name='Forecast Impressions',
-            line=dict(color='red', width=2)
-        ))
-    
-    # Add trendlines
-    if not hist_impressions.empty and len(hist_impressions) >= 2:
-        fig_impressions = add_simple_trendline(fig_impressions, hist_impressions["ds"], hist_impressions["actual_impressions"], "Historical Impressions", "gray")
-    if filtered_impr_fc is not None and not filtered_impr_fc.empty and len(filtered_impr_fc) >= 2:
-        fig_impressions = add_simple_trendline(fig_impressions, filtered_impr_fc["ds"], filtered_impr_fc["impressions"], "Forecast Impressions", "lightcoral")
-    
-    fig_impressions = create_chart_with_hierarchical_controls(fig_impressions, original_impr_fc, 'impressions')
-    fig_impressions.update_layout(
-        title="Impressions Forecast with Hierarchical Dynamic Trendlines",
-        xaxis_title="Date",
-        yaxis_title="Impressions",
-        hovermode='x unified'
-    )
+    fig_orders = create_single_forecast_chart(filtered_table, 'orders', None, original_table, 
+                                           colors_map['orders'], True, "Hierarchical ")
+    fig_clicks = create_single_forecast_chart(filtered_table, 'clicks', filtered_clicks_fc, original_clicks_fc,
+                                           colors_map['clicks'], True, "Hierarchical ")
+    fig_impressions = create_single_forecast_chart(filtered_table, 'impressions', filtered_impr_fc, original_impr_fc,
+                                                colors_map['impressions'], True, "Hierarchical ")
     
     return fig_orders, fig_clicks, fig_impressions
 
@@ -467,193 +423,15 @@ def run_sem_pipeline(df_full):
 
 def create_forecast_charts(table, orders_fc, clicks_fc, impr_fc):
     """Create interactive Plotly charts with dynamic trendlines"""
+    colors_map = {
+        'orders': {'actual': 'black', 'forecast': 'blue', 'ci': 'rgba(0,100,80,0.2)'},
+        'clicks': {'actual': 'black', 'forecast': 'green', 'ci': 'rgba(0,128,0,0.2)'},
+        'impressions': {'actual': 'black', 'forecast': 'red', 'ci': 'rgba(255,0,0,0.2)'}
+    }
     
-    # Determine split point between historical and forecast data
-    last_actual = table[table["actual_orders"].notna()]["ds"].max() if not table[table["actual_orders"].notna()].empty else None
-    
-    # Orders Chart
-    fig_orders = go.Figure()
-    
-    # Historical data
-    hist_data = table[table["actual_orders"].notna()]
-    if not hist_data.empty:
-        fig_orders.add_trace(go.Scatter(
-            x=hist_data["ds"],
-            y=hist_data["actual_orders"],
-            mode='lines+markers',
-            name='Actual Orders',
-            line=dict(color='black', width=2)
-        ))
-    
-    # Forecast data
-    forecast_data = table[table["ds"] > last_actual] if last_actual is not None else table[table["orders"].notna()]
-    if not forecast_data.empty:
-        fig_orders.add_trace(go.Scatter(
-            x=forecast_data["ds"],
-            y=forecast_data["orders"],
-            mode='lines+markers',
-            name='Forecast Orders',
-            line=dict(color='blue', width=2)
-        ))
-    
-    # Confidence intervals
-    fig_orders.add_trace(go.Scatter(
-        x=forecast_data["ds"],
-        y=forecast_data["orders_upper"],
-        mode='lines',
-        name='Upper CI',
-        line=dict(width=0),
-        showlegend=False
-    ))
-    
-    fig_orders.add_trace(go.Scatter(
-        x=forecast_data["ds"],
-        y=forecast_data["orders_lower"],
-        mode='lines',
-        name='90% Confidence Interval',
-        fill='tonexty',
-        fillcolor='rgba(0,100,80,0.2)',
-        line=dict(width=0)
-    ))
-    
-    # Add simple trendlines (hidden from legend)
-    if not hist_data.empty and len(hist_data) >= 2:
-        fig_orders = add_simple_trendline(fig_orders, hist_data["ds"], hist_data["actual_orders"], 
-                                        "Historical Orders", "gray")
-    if not forecast_data.empty and len(forecast_data) >= 2:
-        fig_orders = add_simple_trendline(fig_orders, forecast_data["ds"], forecast_data["orders"], 
-                                        "Forecast Orders", "lightblue")
-
-    # Apply chart controls  
-    fig_orders = create_chart_with_hierarchical_controls(fig_orders, table, 'orders')
-    fig_orders.update_layout(
-        title="Orders Forecast with Dynamic Trendlines",
-        xaxis_title="Date",
-        yaxis_title="Orders",
-        hovermode='x unified'
-    )
-    
-    # Clicks Chart
-    fig_clicks = go.Figure()
-    
-    # Historical clicks
-    hist_clicks = table[table["actual_clicks"].notna()]
-    if not hist_clicks.empty:
-        fig_clicks.add_trace(go.Scatter(
-            x=hist_clicks["ds"],
-            y=hist_clicks["actual_clicks"],
-            mode='lines+markers',
-            name='Actual Clicks',
-            line=dict(color='black', width=2)
-        ))
-    
-    # Forecast clicks
-    if clicks_fc is not None and not clicks_fc.empty:
-        fig_clicks.add_trace(go.Scatter(
-            x=clicks_fc["ds"],
-            y=clicks_fc["clicks"],
-            mode='lines+markers',
-            name='Forecast Clicks',
-            line=dict(color='green', width=2)
-        ))
-    
-    # Confidence intervals for clicks
-    if clicks_fc is not None and not clicks_fc.empty and 'clicks_upper' in clicks_fc.columns:
-        fig_clicks.add_trace(go.Scatter(
-            x=clicks_fc["ds"],
-            y=clicks_fc["clicks_upper"],
-            mode='lines',
-            line=dict(width=0),
-            showlegend=False
-        ))
-        
-        fig_clicks.add_trace(go.Scatter(
-            x=clicks_fc["ds"],
-            y=clicks_fc["clicks_lower"],
-            mode='lines',
-            fill='tonexty',
-            fillcolor='rgba(0,128,0,0.2)',
-            line=dict(width=0),
-            name='90% Confidence Interval'
-        ))
-    
-    # Add simple trendlines (hidden from legend)
-    if not hist_clicks.empty and len(hist_clicks) >= 2:
-        fig_clicks = add_simple_trendline(fig_clicks, hist_clicks["ds"], hist_clicks["actual_clicks"], 
-                                        "Historical Clicks", "gray")
-    if clicks_fc is not None and not clicks_fc.empty and len(clicks_fc) >= 2:
-        fig_clicks = add_simple_trendline(fig_clicks, clicks_fc["ds"], clicks_fc["clicks"], 
-                                        "Forecast Clicks", "lightgreen")
-
-    # Apply chart controls
-    fig_clicks = create_chart_with_hierarchical_controls(fig_clicks, table, 'clicks')  
-    fig_clicks.update_layout(
-        title="Clicks Forecast with Dynamic Trendlines",
-        xaxis_title="Date",
-        yaxis_title="Clicks",
-        hovermode='x unified'
-    )
-    
-    # Impressions Chart
-    fig_impressions = go.Figure()
-    
-    # Historical impressions
-    hist_impressions = table[table["actual_impressions"].notna()]
-    if not hist_impressions.empty:
-        fig_impressions.add_trace(go.Scatter(
-            x=hist_impressions["ds"],
-            y=hist_impressions["actual_impressions"],
-            mode='lines+markers',
-            name='Actual Impressions',
-            line=dict(color='black', width=2)
-        ))
-    
-    # Forecast impressions
-    if impr_fc is not None and not impr_fc.empty:
-        fig_impressions.add_trace(go.Scatter(
-            x=impr_fc["ds"],
-            y=impr_fc["impressions"],
-            mode='lines+markers',
-            name='Forecast Impressions',
-            line=dict(color='red', width=2)
-        ))
-    
-    # Confidence intervals for impressions
-    if impr_fc is not None and not impr_fc.empty and 'impressions_upper' in impr_fc.columns:
-        fig_impressions.add_trace(go.Scatter(
-            x=impr_fc["ds"],
-            y=impr_fc["impressions_upper"],
-            mode='lines',
-            line=dict(width=0),
-            showlegend=False
-        ))
-        
-        fig_impressions.add_trace(go.Scatter(
-            x=impr_fc["ds"],
-            y=impr_fc["impressions_lower"],
-            mode='lines',
-            fill='tonexty',
-            fillcolor='rgba(255,0,0,0.2)',
-            line=dict(width=0),
-            name='90% Confidence Interval'
-        ))
-    
-    # Add simple trendlines (hidden from legend)
-    if not hist_impressions.empty and len(hist_impressions) >= 2:
-        fig_impressions = add_simple_trendline(fig_impressions, hist_impressions["ds"], hist_impressions["actual_impressions"], 
-                                             "Historical Impressions", "gray")
-    if impr_fc is not None and not impr_fc.empty and len(impr_fc) >= 2:
-        fig_impressions = add_simple_trendline(fig_impressions, impr_fc["ds"], impr_fc["impressions"], 
-                                             "Forecast Impressions", "lightcoral")
-
-    # Apply chart controls
-    fig_impressions = create_chart_with_hierarchical_controls(fig_impressions, table, 'impressions')
-    fig_impressions.update_layout(
-        title="Impressions Forecast with Dynamic Trendlines",
-        xaxis_title="Date",
-        yaxis_title="Impressions",
-        hovermode='x unified'
-    )
+    fig_orders = create_single_forecast_chart(table, 'orders', None, table, colors_map['orders'], True)
+    fig_clicks = create_single_forecast_chart(table, 'clicks', clicks_fc, table, colors_map['clicks'], True)
+    fig_impressions = create_single_forecast_chart(table, 'impressions', impr_fc, table, colors_map['impressions'], True)
     
     return fig_orders, fig_clicks, fig_impressions
 
@@ -676,61 +454,100 @@ def calculate_summary_metrics(table):
     
     return metrics
 
-def aggregate_weekly_data(table):
-    """Aggregate daily data to weekly view"""
-    weekly_table = table.copy()
+def aggregate_data_by_period(table, period='W'):
+    """Aggregate daily data to specified period (W=weekly, M=monthly)"""
+    aggregated_table = table.copy()
     
-    # Add week start date
-    weekly_table['week_start'] = weekly_table['ds'].dt.to_period('W').dt.start_time
-    
-    # Define aggregation functions for different column types
-    agg_funcs = {}
+    # Add period start date
+    period_col = 'period_start'
+    aggregated_table[period_col] = aggregated_table['ds'].dt.to_period(period).dt.start_time
     
     # Sum columns - but handle NaN values properly
     sum_cols = ['actual_orders', 'orders', 'actual_clicks', 'clicks', 'actual_impressions', 
                 'impressions', 'cost', 'planned_cost', 'orders_lower', 'orders_upper', 
                 'clicks_lower', 'clicks_upper', 'impressions_lower', 'impressions_upper']
     
-    for col in sum_cols:
-        if col in weekly_table.columns:
-            # Use sum with skipna=True, but convert 0 sums back to NaN where all values were NaN
-            agg_funcs[col] = lambda x: x.sum() if x.notna().any() else np.nan
-    
-    # Group by week and aggregate
-    weekly_data = weekly_table.groupby('week_start').apply(
+    # Group by period and aggregate
+    aggregated_data = aggregated_table.groupby(period_col).apply(
         lambda group: pd.Series({
             col: group[col].sum() if group[col].notna().any() else np.nan
             for col in sum_cols if col in group.columns
         })
     ).reset_index()
     
-    weekly_data.rename(columns={'week_start': 'ds'}, inplace=True)
+    aggregated_data.rename(columns={period_col: 'ds'}, inplace=True)
     
-    return weekly_data
+    return aggregated_data
+
+def aggregate_weekly_data(table):
+    """Aggregate daily data to weekly view"""
+    return aggregate_data_by_period(table, 'W')
 
 def aggregate_monthly_data(table):
     """Aggregate daily data to monthly view"""
-    monthly_table = table.copy()
+    return aggregate_data_by_period(table, 'M')
+
+def calculate_marketing_metrics(display_table):
+    """Calculate CPO, CPC, and CPM metrics for a display table"""
+    def get_combined_value(row, actual_col, forecast_col):
+        """Combine actual and forecast values, handling historical, current, and future periods"""
+        actual_exists = actual_col in display_table.columns
+        forecast_exists = forecast_col in display_table.columns
+        
+        actual_val = row.get(actual_col, np.nan) if actual_exists else np.nan
+        forecast_val = row.get(forecast_col, np.nan) if forecast_exists else np.nan
+        
+        # Convert to numeric, treating 0 as a valid value
+        actual_val = pd.to_numeric(actual_val, errors='coerce')
+        forecast_val = pd.to_numeric(forecast_val, errors='coerce')
+        
+        # If both values exist and are not null, add them (mid-month scenario)
+        if pd.notnull(actual_val) and pd.notnull(forecast_val):
+            return actual_val + forecast_val
+        # If only actual exists and is valid, use it (historical months)
+        elif pd.notnull(actual_val):
+            return actual_val
+        # If only forecast exists and is valid, use it (future months)
+        elif pd.notnull(forecast_val):
+            return forecast_val
+        # If neither exists or both are invalid, return nan
+        else:
+            return np.nan
     
-    # Add month start date
-    monthly_table['month_start'] = monthly_table['ds'].dt.to_period('M').dt.start_time
+    def calculate_metric(row, numerator_cols, denominator_cols, multiplier=1):
+        """Generic metric calculation function"""
+        combined_cost = get_combined_value(row, numerator_cols[0], numerator_cols[1])
+        if pd.isnull(combined_cost) or combined_cost == 0:
+            return np.nan
+        combined_volume = get_combined_value(row, denominator_cols[0], denominator_cols[1])
+        return (combined_cost / combined_volume) * multiplier if combined_volume > 0 else np.nan
     
-    # Sum columns - but handle NaN values properly
-    sum_cols = ['actual_orders', 'orders', 'actual_clicks', 'clicks', 'actual_impressions', 
-                'impressions', 'cost', 'planned_cost', 'orders_lower', 'orders_upper', 
-                'clicks_lower', 'clicks_upper', 'impressions_lower', 'impressions_upper']
+    # Check if we have cost columns available
+    has_cost = 'cost' in display_table.columns or 'planned_cost' in display_table.columns
     
-    # Group by month and aggregate
-    monthly_data = monthly_table.groupby('month_start').apply(
-        lambda group: pd.Series({
-            col: group[col].sum() if group[col].notna().any() else np.nan
-            for col in sum_cols if col in group.columns
-        })
-    ).reset_index()
+    if has_cost:
+        # CPO (Cost Per Order)
+        if 'orders' in display_table.columns or 'actual_orders' in display_table.columns:
+            display_table['CPO'] = display_table.apply(
+                lambda row: calculate_metric(row, ('cost', 'planned_cost'), ('actual_orders', 'orders')), 
+                axis=1
+            )
+        
+        # CPC (Cost Per Click)
+        if 'clicks' in display_table.columns or 'actual_clicks' in display_table.columns:
+            display_table['CPC'] = display_table.apply(
+                lambda row: calculate_metric(row, ('cost', 'planned_cost'), ('actual_clicks', 'clicks')), 
+                axis=1
+            )
+        
+        # CPM (Cost Per Thousand Impressions)  
+        if 'impressions' in display_table.columns or 'actual_impressions' in display_table.columns:
+            display_table['CPM'] = display_table.apply(
+                lambda row: calculate_metric(row, ('cost', 'planned_cost'), ('actual_impressions', 'impressions'), 1000), 
+                axis=1
+            )
     
-    monthly_data.rename(columns={'month_start': 'ds'}, inplace=True)
-    
-    return monthly_data
+    return display_table
 
 def apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment):
     """Apply budget scenario adjustments to the forecast table - ensures Prophet regressor columns are updated"""
@@ -1353,189 +1170,25 @@ def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_or
     return fig
 
 def create_weekly_forecast_charts(weekly_table, title_suffix="Weekly"):
-    """Create weekly forecast charts"""
+    """Create weekly forecast charts using consolidated chart creation function"""
+    colors_map = {
+        'orders': {'actual': 'black', 'forecast': 'blue', 'ci': 'rgba(0,100,80,0.2)'},
+        'clicks': {'actual': 'black', 'forecast': 'green', 'ci': 'rgba(0,128,0,0.2)'},
+        'impressions': {'actual': 'black', 'forecast': 'red', 'ci': 'rgba(255,0,0,0.2)'}
+    }
     
-    # Determine split point between historical and forecast data
-    last_actual = weekly_table[weekly_table["actual_orders"].notna()]["ds"].max()
+    # Create charts with custom titles and axis labels for weekly view
+    fig_orders = create_single_forecast_chart(weekly_table, 'orders', None, weekly_table, 
+                                           colors_map['orders'], True, f"{title_suffix} ")
+    fig_orders.update_layout(xaxis_title="Week Starting")
     
-    # Orders Chart
-    fig_orders = go.Figure()
+    fig_clicks = create_single_forecast_chart(weekly_table, 'clicks', None, weekly_table,
+                                           colors_map['clicks'], True, f"{title_suffix} ")
+    fig_clicks.update_layout(xaxis_title="Week Starting")
     
-    # Historical data
-    hist_data = weekly_table[weekly_table["actual_orders"].notna()]
-    if not hist_data.empty:
-        fig_orders.add_trace(go.Scatter(
-            x=hist_data["ds"],
-            y=hist_data["actual_orders"],
-            mode='lines+markers',
-            name='Actual Orders',
-            line=dict(color='black', width=2)
-        ))
-    
-    # Forecast data
-    forecast_data = weekly_table[weekly_table["ds"] > last_actual] if not pd.isna(last_actual) else weekly_table[weekly_table["orders"].notna()]
-    if not forecast_data.empty:
-        fig_orders.add_trace(go.Scatter(
-            x=forecast_data["ds"],
-            y=forecast_data["orders"],
-            mode='lines+markers',
-            name='Forecast Orders',
-            line=dict(color='blue', width=2)
-        ))
-        
-        # Confidence intervals
-        if 'orders_upper' in forecast_data.columns and 'orders_lower' in forecast_data.columns:
-            fig_orders.add_trace(go.Scatter(
-                x=forecast_data["ds"],
-                y=forecast_data["orders_upper"],
-                mode='lines',
-                name='Upper CI',
-                line=dict(width=0),
-                showlegend=False
-            ))
-            
-            fig_orders.add_trace(go.Scatter(
-                x=forecast_data["ds"],
-                y=forecast_data["orders_lower"],
-                mode='lines',
-                name='90% Confidence Interval',
-                fill='tonexty',
-                fillcolor='rgba(0,100,80,0.2)',
-                line=dict(width=0)
-            ))
-    
-    # Add simple trendlines for weekly orders (hidden from legend)
-    if not hist_data.empty and len(hist_data) >= 2:
-        fig_orders = add_simple_trendline(fig_orders, hist_data["ds"], hist_data["actual_orders"], "Historical Orders", "gray")
-    if not forecast_data.empty and len(forecast_data) >= 2:
-        fig_orders = add_simple_trendline(fig_orders, forecast_data["ds"], forecast_data["orders"], "Forecast Orders", "lightblue")
-
-    # Apply chart controls
-    fig_orders = create_chart_with_hierarchical_controls(fig_orders, weekly_table, f'weekly_orders')
-    fig_orders.update_layout(
-        title=f"Orders Forecast - {title_suffix} View with Dynamic Trendlines", 
-        xaxis_title="Week Starting",
-        yaxis_title="Orders",
-        hovermode='x unified'
-    )
-    
-    # Clicks Chart
-    fig_clicks = go.Figure()
-    
-    # Historical clicks data
-    hist_clicks = weekly_table[weekly_table["actual_clicks"].notna()]
-    if not hist_clicks.empty:
-        fig_clicks.add_trace(go.Scatter(
-            x=hist_clicks["ds"],
-            y=hist_clicks["actual_clicks"],
-            mode='lines+markers',
-            name='Actual Clicks',
-            line=dict(color='black', width=2)
-        ))
-    
-    # Forecast clicks data
-    clicks_forecast = weekly_table[weekly_table["ds"] > last_actual] if not pd.isna(last_actual) else weekly_table[weekly_table["clicks"].notna()]
-    if not clicks_forecast.empty:
-        fig_clicks.add_trace(go.Scatter(
-            x=clicks_forecast["ds"],
-            y=clicks_forecast["clicks"],
-            mode='lines+markers',
-            name='Forecast Clicks',
-            line=dict(color='green', width=2)
-        ))
-        
-        if 'clicks_upper' in clicks_forecast.columns and 'clicks_lower' in clicks_forecast.columns:
-            fig_clicks.add_trace(go.Scatter(
-                x=clicks_forecast["ds"],
-                y=clicks_forecast["clicks_upper"],
-                mode='lines',
-                line=dict(width=0),
-                showlegend=False
-            ))
-            
-            fig_clicks.add_trace(go.Scatter(
-                x=clicks_forecast["ds"],
-                y=clicks_forecast["clicks_lower"],
-                mode='lines',
-                fill='tonexty',
-                fillcolor='rgba(0,128,0,0.2)',
-                line=dict(width=0),
-                name='90% Confidence Interval'
-            ))
-    
-    # Add simple trendlines for weekly clicks (hidden from legend)
-    if not hist_clicks.empty and len(hist_clicks) >= 2:
-        fig_clicks = add_simple_trendline(fig_clicks, hist_clicks["ds"], hist_clicks["actual_clicks"], "Historical Clicks", "gray")
-    if not clicks_forecast.empty and len(clicks_forecast) >= 2:
-        fig_clicks = add_simple_trendline(fig_clicks, clicks_forecast["ds"], clicks_forecast["clicks"], "Forecast Clicks", "lightgreen")
-
-    # Apply chart controls
-    fig_clicks = create_chart_with_hierarchical_controls(fig_clicks, weekly_table, f'weekly_clicks')
-    fig_clicks.update_layout(
-        title=f"Clicks Forecast - {title_suffix} View with Dynamic Trendlines",
-        xaxis_title="Week Starting", 
-        yaxis_title="Clicks",
-        hovermode='x unified'
-    )
-    
-    # Impressions Chart
-    fig_impressions = go.Figure()
-    
-    # Historical impressions data
-    hist_impressions = weekly_table[weekly_table["actual_impressions"].notna()]
-    if not hist_impressions.empty:
-        fig_impressions.add_trace(go.Scatter(
-            x=hist_impressions["ds"],
-            y=hist_impressions["actual_impressions"],
-            mode='lines+markers',
-            name='Actual Impressions',
-            line=dict(color='black', width=2)
-        ))
-    
-    # Forecast impressions data
-    impr_forecast = weekly_table[weekly_table["ds"] > last_actual] if not pd.isna(last_actual) else weekly_table[weekly_table["impressions"].notna()]
-    if not impr_forecast.empty:
-        fig_impressions.add_trace(go.Scatter(
-            x=impr_forecast["ds"],
-            y=impr_forecast["impressions"],
-            mode='lines+markers',
-            name='Forecast Impressions',
-            line=dict(color='red', width=2)
-        ))
-        
-        if 'impressions_upper' in impr_forecast.columns and 'impressions_lower' in impr_forecast.columns:
-            fig_impressions.add_trace(go.Scatter(
-                x=impr_forecast["ds"],
-                y=impr_forecast["impressions_upper"],
-                mode='lines',
-                line=dict(width=0),
-                showlegend=False
-            ))
-            
-            fig_impressions.add_trace(go.Scatter(
-                x=impr_forecast["ds"],
-                y=impr_forecast["impressions_lower"],
-                mode='lines',
-                fill='tonexty',
-                fillcolor='rgba(255,0,0,0.2)',
-                line=dict(width=0),
-                name='90% Confidence Interval'
-            ))
-    
-    # Add simple trendlines for weekly impressions (hidden from legend)
-    if not hist_impressions.empty and len(hist_impressions) >= 2:
-        fig_impressions = add_simple_trendline(fig_impressions, hist_impressions["ds"], hist_impressions["actual_impressions"], "Historical Impressions", "gray")
-    if not impr_forecast.empty and len(impr_forecast) >= 2:
-        fig_impressions = add_simple_trendline(fig_impressions, impr_forecast["ds"], impr_forecast["impressions"], "Forecast Impressions", "lightcoral")
-
-    # Apply chart controls
-    fig_impressions = create_chart_with_hierarchical_controls(fig_impressions, weekly_table, f'weekly_impressions')
-    fig_impressions.update_layout(
-        title=f"Impressions Forecast - {title_suffix} View with Dynamic Trendlines",
-        xaxis_title="Week Starting",
-        yaxis_title="Impressions", 
-        hovermode='x unified'
-    )
+    fig_impressions = create_single_forecast_chart(weekly_table, 'impressions', None, weekly_table,
+                                                colors_map['impressions'], True, f"{title_suffix} ")
+    fig_impressions.update_layout(xaxis_title="Week Starting")
     
     return fig_orders, fig_clicks, fig_impressions
 
@@ -1745,69 +1398,7 @@ if uploaded_file is not None:
                 display_table[numeric_cols] = display_table[numeric_cols].round(0)
                 
                 # Calculate CPO, CPC, and CPM metrics
-                # Check if we have cost columns available
-                has_cost = 'cost' in display_table.columns
-                has_planned_cost = 'planned_cost' in display_table.columns
-                
-                
-                if has_cost or has_planned_cost:
-                    def get_combined_value(row, actual_col, forecast_col):
-                        """Combine actual and forecast values, handling historical, current, and future periods"""
-                        actual_exists = actual_col in display_table.columns
-                        forecast_exists = forecast_col in display_table.columns
-                        
-                        actual_val = row.get(actual_col, np.nan) if actual_exists else np.nan
-                        forecast_val = row.get(forecast_col, np.nan) if forecast_exists else np.nan
-                        
-                        # Convert to numeric, treating 0 as a valid value
-                        actual_val = pd.to_numeric(actual_val, errors='coerce')
-                        forecast_val = pd.to_numeric(forecast_val, errors='coerce')
-                        
-                        # If both values exist and are not null, add them (mid-month scenario)
-                        if pd.notnull(actual_val) and pd.notnull(forecast_val):
-                            return actual_val + forecast_val
-                        # If only actual exists and is valid, use it (historical months)
-                        elif pd.notnull(actual_val):
-                            return actual_val
-                        # If only forecast exists and is valid, use it (future months)
-                        elif pd.notnull(forecast_val):
-                            return forecast_val
-                        # If neither exists or both are invalid, return nan
-                        else:
-                            return np.nan
-                    
-                    # CPO (Cost Per Order)
-                    if 'orders' in display_table.columns or 'actual_orders' in display_table.columns:
-                        def calculate_cpo(row):
-                            combined_cost = get_combined_value(row, 'cost', 'planned_cost')
-                            if pd.isnull(combined_cost) or combined_cost == 0:
-                                return np.nan
-                            combined_orders = get_combined_value(row, 'actual_orders', 'orders')
-                            return combined_cost / combined_orders if combined_orders > 0 else np.nan
-                        
-                        display_table['CPO'] = display_table.apply(calculate_cpo, axis=1)
-                    
-                    # CPC (Cost Per Click)
-                    if 'clicks' in display_table.columns or 'actual_clicks' in display_table.columns:
-                        def calculate_cpc(row):
-                            combined_cost = get_combined_value(row, 'cost', 'planned_cost')
-                            if pd.isnull(combined_cost) or combined_cost == 0:
-                                return np.nan
-                            combined_clicks = get_combined_value(row, 'actual_clicks', 'clicks')
-                            return combined_cost / combined_clicks if combined_clicks > 0 else np.nan
-                        
-                        display_table['CPC'] = display_table.apply(calculate_cpc, axis=1)
-                    
-                    # CPM (Cost Per Thousand Impressions)  
-                    if 'impressions' in display_table.columns or 'actual_impressions' in display_table.columns:
-                        def calculate_cpm(row):
-                            combined_cost = get_combined_value(row, 'cost', 'planned_cost')
-                            if pd.isnull(combined_cost) or combined_cost == 0:
-                                return np.nan
-                            combined_impressions = get_combined_value(row, 'actual_impressions', 'impressions')
-                            return (combined_cost / combined_impressions) * 1000 if combined_impressions > 0 else np.nan
-                        
-                        display_table['CPM'] = display_table.apply(calculate_cpm, axis=1)
+                display_table = calculate_marketing_metrics(display_table)
                 
                 # Format cost columns
                 for col in ["cost", "planned_cost"]:
