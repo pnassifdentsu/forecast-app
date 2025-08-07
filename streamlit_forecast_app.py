@@ -374,6 +374,9 @@ def load_dataframe(uploaded_file) -> pd.DataFrame:
         st.error(f"Error reading file: {str(e)}")
         return None
     
+    # Clean column names by stripping whitespace and normalizing
+    df.columns = df.columns.str.strip()
+    
     missing = REQ_COLS - set(df.columns)
     if missing:
         st.error(f"Missing required columns: {', '.join(sorted(missing))}")
@@ -1741,11 +1744,83 @@ if uploaded_file is not None:
                 numeric_cols = display_table.select_dtypes(include=[np.number]).columns
                 display_table[numeric_cols] = display_table[numeric_cols].round(0)
                 
+                # Calculate CPO, CPC, and CPM metrics
+                # Check if we have cost columns available
+                has_cost = 'cost' in display_table.columns
+                has_planned_cost = 'planned_cost' in display_table.columns
+                
+                
+                if has_cost or has_planned_cost:
+                    def get_combined_value(row, actual_col, forecast_col):
+                        """Combine actual and forecast values, handling historical, current, and future periods"""
+                        actual_exists = actual_col in display_table.columns
+                        forecast_exists = forecast_col in display_table.columns
+                        
+                        actual_val = row.get(actual_col, np.nan) if actual_exists else np.nan
+                        forecast_val = row.get(forecast_col, np.nan) if forecast_exists else np.nan
+                        
+                        # Convert to numeric, treating 0 as a valid value
+                        actual_val = pd.to_numeric(actual_val, errors='coerce')
+                        forecast_val = pd.to_numeric(forecast_val, errors='coerce')
+                        
+                        # If both values exist and are not null, add them (mid-month scenario)
+                        if pd.notnull(actual_val) and pd.notnull(forecast_val):
+                            return actual_val + forecast_val
+                        # If only actual exists and is valid, use it (historical months)
+                        elif pd.notnull(actual_val):
+                            return actual_val
+                        # If only forecast exists and is valid, use it (future months)
+                        elif pd.notnull(forecast_val):
+                            return forecast_val
+                        # If neither exists or both are invalid, return nan
+                        else:
+                            return np.nan
+                    
+                    # CPO (Cost Per Order)
+                    if 'orders' in display_table.columns or 'actual_orders' in display_table.columns:
+                        def calculate_cpo(row):
+                            combined_cost = get_combined_value(row, 'cost', 'planned_cost')
+                            if pd.isnull(combined_cost) or combined_cost == 0:
+                                return np.nan
+                            combined_orders = get_combined_value(row, 'actual_orders', 'orders')
+                            return combined_cost / combined_orders if combined_orders > 0 else np.nan
+                        
+                        display_table['CPO'] = display_table.apply(calculate_cpo, axis=1)
+                    
+                    # CPC (Cost Per Click)
+                    if 'clicks' in display_table.columns or 'actual_clicks' in display_table.columns:
+                        def calculate_cpc(row):
+                            combined_cost = get_combined_value(row, 'cost', 'planned_cost')
+                            if pd.isnull(combined_cost) or combined_cost == 0:
+                                return np.nan
+                            combined_clicks = get_combined_value(row, 'actual_clicks', 'clicks')
+                            return combined_cost / combined_clicks if combined_clicks > 0 else np.nan
+                        
+                        display_table['CPC'] = display_table.apply(calculate_cpc, axis=1)
+                    
+                    # CPM (Cost Per Thousand Impressions)  
+                    if 'impressions' in display_table.columns or 'actual_impressions' in display_table.columns:
+                        def calculate_cpm(row):
+                            combined_cost = get_combined_value(row, 'cost', 'planned_cost')
+                            if pd.isnull(combined_cost) or combined_cost == 0:
+                                return np.nan
+                            combined_impressions = get_combined_value(row, 'actual_impressions', 'impressions')
+                            return (combined_cost / combined_impressions) * 1000 if combined_impressions > 0 else np.nan
+                        
+                        display_table['CPM'] = display_table.apply(calculate_cpm, axis=1)
+                
                 # Format cost columns
                 for col in ["cost", "planned_cost"]:
                     if col in display_table.columns:
                         display_table[col] = display_table[col].apply(
                             lambda x: f"${x:,.0f}" if pd.notnull(x) else ""
+                        )
+                
+                # Format CPO, CPC, and CPM columns
+                for col in ["CPO", "CPC", "CPM"]:
+                    if col in display_table.columns:
+                        display_table[col] = display_table[col].apply(
+                            lambda x: f"${x:.2f}" if pd.notnull(x) else ""
                         )
                 
                 st.dataframe(
@@ -1994,8 +2069,6 @@ if uploaded_file is not None:
                             f"{impact:+,.0f}",
                             delta=f"{(impact/baseline_total*100):+.1f}%" if baseline_total > 0 else "N/A"
                         )
-                        if scenario_lower != scenario_total or scenario_upper != scenario_total:
-                            st.caption(f"90% CI: [{impact_lower:+,.0f} to {impact_upper:+,.0f}]")
                     
                     with col2:
                         # Get future data for both scenarios
