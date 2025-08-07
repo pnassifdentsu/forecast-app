@@ -408,16 +408,32 @@ def run_sem_pipeline(df_full):
         train, "orders", BASE_REGS + ["clicks", "impressions"], fut_orders
     )
     
-    # Combined results table
+    # Combined results table - start with historical data and add future data
     table = (
-        hist[["ds", "cost", "orders", "clicks", "impressions"]]
+        hist[["ds", "cost", "orders", "clicks", "impressions", "brand_cost", "nonbrand_cost"]]
         .rename(columns={"orders": "actual_orders", "clicks": "actual_clicks", "impressions": "actual_impressions"})
         .merge(orders_fc[["ds", "orders", "orders_lower", "orders_upper"]], on="ds", how="outer")
         .merge(clicks_fc[["ds", "clicks", "clicks_lower", "clicks_upper"]], on="ds", how="outer")
         .merge(impr_fc[["ds", "impressions", "impressions_lower", "impressions_upper"]], on="ds", how="outer")
-        .merge(future[["ds", "cost"]].rename(columns={"cost": "planned_cost"}), on="ds", how="outer")
         .sort_values("ds")
     )
+    
+    # Add future cost data - merge only planned_cost to avoid column conflicts
+    future_planned_cost = future[["ds", "cost"]].rename(columns={"cost": "planned_cost"})
+    table = table.merge(future_planned_cost, on="ds", how="left")
+    
+    # For future periods, get brand_cost and nonbrand_cost directly from future data
+    future_periods = table['actual_orders'].isna()
+    
+    # Create a mapping from future data for brand/nonbrand costs
+    future_brand_nonbrand = future[["ds", "brand_cost", "nonbrand_cost"]].set_index("ds")
+    
+    # Fill future periods with correct brand/nonbrand costs from future data
+    for idx, row in table[future_periods].iterrows():
+        ds_value = row['ds']
+        if ds_value in future_brand_nonbrand.index:
+            table.loc[idx, 'brand_cost'] = future_brand_nonbrand.loc[ds_value, 'brand_cost']
+            table.loc[idx, 'nonbrand_cost'] = future_brand_nonbrand.loc[ds_value, 'nonbrand_cost']
     
     return table, orders_fc, clicks_fc, impr_fc
 
@@ -464,8 +480,9 @@ def aggregate_data_by_period(table, period='W'):
     
     # Sum columns - but handle NaN values properly
     sum_cols = ['actual_orders', 'orders', 'actual_clicks', 'clicks', 'actual_impressions', 
-                'impressions', 'cost', 'planned_cost', 'orders_lower', 'orders_upper', 
-                'clicks_lower', 'clicks_upper', 'impressions_lower', 'impressions_upper']
+                'impressions', 'cost', 'planned_cost', 'brand_cost', 'nonbrand_cost',
+                'orders_lower', 'orders_upper', 'clicks_lower', 'clicks_upper', 
+                'impressions_lower', 'impressions_upper']
     
     # Group by period and aggregate
     aggregated_data = aggregated_table.groupby(period_col).apply(

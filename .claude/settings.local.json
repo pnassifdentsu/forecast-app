@@ -3,7 +3,11 @@
     "allow": [
       "Bash(git add:*)",
       "Bash(git push:*)",
-      "Bash(git init:*)"
+      "Bash(git init:*)",
+      "Bash(python:*)",
+      "Bash(findstr:*)",
+      "Bash(powershell:*)",
+      "Bash(awk:*)"
     ],
     "deny": []
   }
