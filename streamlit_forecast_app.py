@@ -1011,7 +1011,7 @@ def calculate_incremental_impact(baseline_table, scenario_table, elasticities):
     return total_impact_factor, impact_details, total_impact_factor_lower, total_impact_factor_upper
 
 def generate_scenario_forecast(scenario_table, baseline_table=None):
-    """Generate new forecasts using sophisticated elasticity-based modeling"""
+    """Generate new forecasts using elasticity-based modeling"""
     
     # Get future data from scenario table
     future_data = scenario_table[scenario_table["actual_orders"].isna()].copy()
@@ -1436,7 +1436,7 @@ if uploaded_file is not None:
                 
                 with st.expander("📖 Methodology"):
                     st.markdown("""
-                    **Sophisticated Elasticity-Based Modeling with Recency Weighting:**
+                    **Elasticity-Based Modeling with Recency Weighting:**
                     
                     1. **Historical Analysis**: Calculates separate elasticities for brand vs non-brand spend based on your historical data
                     2. **Recency Weighting**: Recent performance is weighted more heavily:
@@ -1479,158 +1479,6 @@ if uploaded_file is not None:
                         scenario_table, table
                     )
                     
-                    # Enhanced debug information showing elasticity analysis - Always visible for troubleshooting
-                    st.subheader("🔍 Elasticity Analysis & Debug")
-                    if True:  # Temporarily always show debug info
-                        st.write("**Available columns in data:**", list(table.columns))
-                        future_data = table[table["actual_orders"].isna()]
-                        st.write(f"**Future periods found:** {len(future_data)} days")
-                        
-                        # Debug scenario calculations
-                        st.write("**Scenario Debug:**")
-                        st.write(f"Brand adjustment: {brand_adjustment}%")
-                        st.write(f"Non-brand adjustment: {nonbrand_adjustment}%")
-                        st.write("**Prophet Model Uses:** brand_cost, nonbrand_cost, promo_flag, clicks, impressions")
-                        
-                        # Check if adjustments were applied
-                        baseline_future = table[table["actual_orders"].isna()]
-                        scenario_future_debug = scenario_table[scenario_table["actual_orders"].isna()]
-                        
-                        if len(baseline_future) > 0 and len(scenario_future_debug) > 0:
-                            for col in ['brand_cost', 'nonbrand_cost', 'cost', 'planned_cost']:
-                                if col in baseline_future.columns:
-                                    baseline_sum = baseline_future[col].sum()
-                                    scenario_sum = scenario_future_debug[col].sum()
-                                    change = scenario_sum - baseline_sum
-                                    st.write(f"- {col}: ${baseline_sum:,.0f} → ${scenario_sum:,.0f} (${change:+,.0f})")
-                        
-                        # Check orders calculation
-                        baseline_orders_sum = baseline_future['orders'].sum() if 'orders' in baseline_future.columns else 0
-                        scenario_orders_sum = scenario_orders_fc['orders'].sum() if scenario_orders_fc is not None else 0
-                        orders_change = scenario_orders_sum - baseline_orders_sum
-                        st.write(f"**Orders Forecast:**")
-                        st.write(f"- Baseline: {baseline_orders_sum:,.0f} orders")
-                        st.write(f"- Scenario: {scenario_orders_sum:,.0f} orders")
-                        st.write(f"- Incremental: {orders_change:+,.0f} orders")
-                        if baseline_orders_sum > 0:
-                            percent_change = (orders_change / baseline_orders_sum) * 100
-                            st.write(f"- % Change: {percent_change:+.1f}%")
-                        
-                        # Show impact factor calculation
-                        impact_factor = scenario_metrics.get('impact_factor', 1.0)
-                        st.write(f"**Impact Factor Applied: {impact_factor:.3f}**")
-                        if impact_factor == 1.0:
-                            st.error("⚠️ Impact factor is 1.0 - no incremental effect calculated!")
-                            st.write("This usually means:")
-                            st.write("- No cost changes were detected")
-                            st.write("- Elasticity calculations returned zero")
-                            st.write("- Brand/non-brand columns are missing or empty")
-                        else:
-                            st.success(f"✅ Impact factor calculated: {impact_factor:.3f} ({(impact_factor-1)*100:+.1f}% change)")
-                        
-                        # Show elasticity calculations
-                        if 'elasticities' in scenario_metrics:
-                            elasticities = scenario_metrics['elasticities']
-                            
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("Brand Elasticity", f"{elasticities['brand_elasticity']:.1%}")
-                                if elasticities.get('confidence_intervals', False):
-                                    brand_lower = elasticities.get('brand_elasticity_lower_ci', 0)
-                                    brand_upper = elasticities.get('brand_elasticity_upper_ci', 0)
-                                    st.caption(f"95% CI: [{brand_lower:.1%} - {brand_upper:.1%}]")
-                                st.metric("Brand Share", f"{elasticities['brand_share']:.1%}")
-                                if 'debug_brand_corr' in elasticities:
-                                    st.write(f"Brand correlation: {elasticities['debug_brand_corr']:.3f}")
-                            with col2:
-                                st.metric("Non-Brand Elasticity", f"{elasticities['nonbrand_elasticity']:.1%}")
-                                if elasticities.get('confidence_intervals', False):
-                                    nonbrand_lower = elasticities.get('nonbrand_elasticity_lower_ci', 0)
-                                    nonbrand_upper = elasticities.get('nonbrand_elasticity_upper_ci', 0)
-                                    st.caption(f"95% CI: [{nonbrand_lower:.1%} - {nonbrand_upper:.1%}]")
-                                st.metric("Non-Brand Share", f"{(1-elasticities['brand_share']):.1%}")
-                                if 'debug_nonbrand_corr' in elasticities:
-                                    st.write(f"Non-brand correlation: {elasticities['debug_nonbrand_corr']:.3f}")
-                            with col3:
-                                st.metric("Elasticity Ratio", f"{elasticities['brand_elasticity']/elasticities['nonbrand_elasticity']:.1f}x")
-                                if elasticities.get('confidence_intervals', False):
-                                    st.caption(f"Bootstrap CI ({elasticities.get('confidence_level', 0.9)*100:.0f}%)")
-                                
-                            # Show detailed correlation debug
-                            if 'debug_brand_corr' in elasticities:
-                                st.write("**Correlation Debug:**")
-                                st.write(f"- Brand: {elasticities['debug_brand_corr']:.4f} correlation → {elasticities['brand_elasticity']:.4f} elasticity")
-                                st.write(f"- Non-brand: {elasticities['debug_nonbrand_corr']:.4f} correlation → {elasticities['nonbrand_elasticity']:.4f} elasticity")
-                                
-                            # Show recency weighting info if available
-                            if elasticities.get('recency_weighted', False):
-                                st.write("**📅 Recency Weighting Applied:**")
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.write(f"Recent data points (≤{elasticities['recency_days']}d): {elasticities['recent_data_points']}")
-                                with col2:
-                                    st.write(f"Avg weight (recent): {elasticities['avg_weight_recent']:.1f}")
-                                with col3:
-                                    st.write(f"Avg weight (old): {elasticities['avg_weight_old']:.1f}")
-                                
-                                st.write(f"Decay half-life: {elasticities['decay_half_life']} days (50% weight reduction)")
-                            else:
-                                st.info("Using default elasticities (insufficient historical data)")
-                            
-                            # Show impact details if available
-                            if 'impact_details' in scenario_metrics:
-                                details = scenario_metrics['impact_details']
-                                st.write("**Spend Change Analysis:**")
-                                
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.write(f"- Brand baseline: ${details['brand_baseline']:,.0f}")
-                                    st.write(f"- Brand change: ${details['brand_spend_change']:+,.0f}")
-                                    st.write(f"- Brand % change: {details['brand_pct_change']:+.1%}")
-                                    st.write(f"- Brand elasticity: {details['brand_elasticity_used']:.3f}")
-                                    st.write(f"- Raw brand impact: {details['raw_brand_impact']:+.4f}")
-                                    st.write(f"- Brand impact: {details['brand_impact_pct']:+.1f}%")
-                                with col2:
-                                    st.write(f"- Non-brand baseline: ${details['nonbrand_baseline']:,.0f}")
-                                    st.write(f"- Non-brand change: ${details['nonbrand_spend_change']:+,.0f}")
-                                    st.write(f"- Non-brand % change: {details['nonbrand_pct_change']:+.1%}")
-                                    st.write(f"- Non-brand elasticity: {details['nonbrand_elasticity_used']:.3f}")
-                                    st.write(f"- Raw non-brand impact: {details['raw_nonbrand_impact']:+.4f}")
-                                    st.write(f"- Non-brand impact: {details['nonbrand_impact_pct']:+.1f}%")
-                                
-                                st.write(f"**Total Impact Factor:** {details['total_impact_factor']:.3f} ({(details['total_impact_factor']-1)*100:+.1f}%)")
-                                
-                                # Show confidence intervals for impact factor
-                                if 'total_impact_factor_lower' in details and 'total_impact_factor_upper' in details:
-                                    lower_factor = details['total_impact_factor_lower']
-                                    upper_factor = details['total_impact_factor_upper']
-                                    st.write(f"**Impact Factor 90% CI:** [{lower_factor:.3f} - {upper_factor:.3f}] ({(lower_factor-1)*100:+.1f}% to {(upper_factor-1)*100:+.1f}%)")
-                                    
-                                    # Show impact range in terms of orders
-                                    baseline_total = orders_fc['orders'].sum() if orders_fc is not None else 0
-                                    if baseline_total > 0:
-                                        lower_orders = baseline_total * (lower_factor - 1)
-                                        upper_orders = baseline_total * (upper_factor - 1)
-                                        st.write(f"**Estimated Orders Impact Range:** {lower_orders:+,.0f} to {upper_orders:+,.0f} orders")
-                                
-                                # Show the math breakdown
-                                st.write("**Impact Calculation Breakdown:**")
-                                st.write(f"- Brand: {details['brand_elasticity_used']:.4f} × ln(1+{details['brand_pct_change']:.3f}) = {details['brand_elasticity_used']:.4f} × {details['brand_log_term']:.4f} = {details['raw_brand_impact']:.4f}")
-                                st.write(f"- Non-brand: {details['nonbrand_elasticity_used']:.4f} × ln(1+{details['nonbrand_pct_change']:.3f}) = {details['nonbrand_elasticity_used']:.4f} × {details['nonbrand_log_term']:.4f} = {details['raw_nonbrand_impact']:.4f}")
-                                st.write(f"- Sum of impacts: {details['sum_impacts']:.4f}")
-                                st.write(f"- Final factor: 1 + {details['sum_impacts']:.4f} = {details['total_impact_factor']:.4f}")
-                                
-                                # Highlight the problem if elasticities are zero
-                                if details['brand_elasticity_used'] == 0 and details['nonbrand_elasticity_used'] == 0:
-                                    st.error("🚨 Both elasticities are ZERO! This means no historical correlation was found between spend and orders.")
-                                elif details['brand_elasticity_used'] == 0:
-                                    st.warning("⚠️ Brand elasticity is ZERO - no historical correlation found.")  
-                                elif details['nonbrand_elasticity_used'] == 0:
-                                    st.warning("⚠️ Non-brand elasticity is ZERO - no historical correlation found.")
-                                elif details['sum_impacts'] == 0:
-                                    st.error("🚨 Sum of impacts is ZERO despite non-zero elasticities! Check the calculation logic.")
-                                    st.write(f"Debug: Baseline had brand_cost: {details.get('debug_baseline_had_brand_cost', 'Unknown')}")
-                                    st.write(f"Debug: Original baseline brand sum: {details.get('debug_baseline_brand_sum_original', 'Unknown')}")
                     
                     # Display scenario comparison
                     st.subheader("📊 Scenario vs Baseline Comparison")
