@@ -566,6 +566,57 @@ def calculate_marketing_metrics(display_table):
     
     return display_table
 
+def get_default_market_multipliers():
+    """Get default market condition multipliers"""
+    return {
+        "economic_multipliers": {
+            "recession": {"orders": 0.75, "clicks": 0.85, "impressions": 0.90, "cost_efficiency": 1.15},
+            "downturn": {"orders": 0.85, "clicks": 0.92, "impressions": 0.95, "cost_efficiency": 1.08},
+            "neutral": {"orders": 1.0, "clicks": 1.0, "impressions": 1.0, "cost_efficiency": 1.0},
+            "growth": {"orders": 1.15, "clicks": 1.08, "impressions": 1.05, "cost_efficiency": 0.95},
+            "boom": {"orders": 1.30, "clicks": 1.15, "impressions": 1.10, "cost_efficiency": 0.85}
+        },
+        "competitive_multipliers": {
+            "high": {"orders": 0.80, "clicks": 0.85, "impressions": 0.90, "cost_efficiency": 1.20},
+            "moderate": {"orders": 0.90, "clicks": 0.95, "impressions": 0.97, "cost_efficiency": 1.05},
+            "neutral": {"orders": 1.0, "clicks": 1.0, "impressions": 1.0, "cost_efficiency": 1.0},
+            "low": {"orders": 1.10, "clicks": 1.05, "impressions": 1.02, "cost_efficiency": 0.95}
+        },
+        "industry_multipliers": {
+            "declining": {"orders": 0.85, "clicks": 0.90, "impressions": 0.95, "cost_efficiency": 1.10},
+            "stable": {"orders": 1.0, "clicks": 1.0, "impressions": 1.0, "cost_efficiency": 1.0},
+            "growing": {"orders": 1.20, "clicks": 1.10, "impressions": 1.05, "cost_efficiency": 0.90},
+            "expanding": {"orders": 1.35, "clicks": 1.18, "impressions": 1.08, "cost_efficiency": 0.85}
+        }
+    }
+
+def initialize_market_conditions_session_state():
+    """Initialize session state with default market condition multipliers"""
+    if 'market_multipliers' not in st.session_state:
+        st.session_state.market_multipliers = get_default_market_multipliers()
+
+def apply_market_conditions(table, economic_condition="neutral", competitive_pressure="neutral", industry_trend="neutral"):
+    """Apply market condition adjustments to forecast table using custom or default multipliers"""
+    scenario_table = table.copy()
+    
+    # Initialize session state if not already done
+    initialize_market_conditions_session_state()
+    
+    # Get multipliers from session state (customizable) or defaults
+    multipliers = st.session_state.market_multipliers
+    economic_multipliers = multipliers["economic_multipliers"]
+    competitive_multipliers = multipliers["competitive_multipliers"] 
+    industry_multipliers = multipliers["industry_multipliers"]
+    
+    # Store market condition factors for use in forecasting
+    scenario_table._market_conditions = {
+        "economic": economic_multipliers.get(economic_condition, economic_multipliers["neutral"]),
+        "competitive": competitive_multipliers.get(competitive_pressure, competitive_multipliers["neutral"]),
+        "industry": industry_multipliers.get(industry_trend, industry_multipliers["stable"])
+    }
+    
+    return scenario_table
+
 def apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment):
     """Apply budget scenario adjustments to the forecast table - ensures Prophet regressor columns are updated"""
     scenario_table = table.copy()
@@ -1046,9 +1097,25 @@ def generate_scenario_forecast(scenario_table, baseline_table=None):
     baseline_future = baseline_table[baseline_table["actual_orders"].isna()].copy()
     scenario_orders_fc = baseline_future[['ds']].copy()
     
+    # Check for market condition adjustments
+    market_impact_factor = 1.0
+    market_clicks_factor = 1.0 
+    market_impressions_factor = 1.0
+    
+    if hasattr(scenario_table, '_market_conditions'):
+        # Combine all market condition effects multiplicatively
+        market_conditions = scenario_table._market_conditions
+        for condition_type, multipliers in market_conditions.items():
+            market_impact_factor *= multipliers.get('orders', 1.0)
+            market_clicks_factor *= multipliers.get('clicks', 1.0)
+            market_impressions_factor *= multipliers.get('impressions', 1.0)
+    
+    # Combine budget impact with market conditions
+    total_impact_factor = impact_factor * market_impact_factor
+    
     if 'orders' in baseline_future.columns and len(baseline_future) > 0:
-        # Apply elasticity-based impact factor to baseline forecast
-        scenario_orders_fc['orders'] = baseline_future['orders'] * impact_factor
+        # Apply combined elasticity and market condition impact factors to baseline forecast
+        scenario_orders_fc['orders'] = baseline_future['orders'] * total_impact_factor
         
         # Add elasticity confidence intervals
         scenario_orders_fc['orders_lower_elasticity'] = baseline_future['orders'] * impact_factor_lower
@@ -1073,8 +1140,8 @@ def generate_scenario_forecast(scenario_table, baseline_table=None):
         scenario_orders_fc['orders_upper'] = 0
     
     # Clicks and impressions respond differently - they're more directly tied to spend
-    clicks_impact = 1 + (impact_factor - 1) * 0.9  # 90% of orders impact
-    impressions_impact = 1 + (impact_factor - 1) * 1.1  # 110% of orders impact (more responsive)
+    clicks_impact = (1 + (impact_factor - 1) * 0.9) * market_clicks_factor  # 90% of orders budget impact + market conditions
+    impressions_impact = (1 + (impact_factor - 1) * 1.1) * market_impressions_factor  # 110% of orders budget impact + market conditions
     
     scenario_clicks_fc = baseline_future[['ds']].copy()
     if 'clicks' in baseline_future.columns and len(baseline_future) > 0:
@@ -1216,6 +1283,9 @@ def create_weekly_forecast_charts(weekly_table, title_suffix="Weekly"):
 st.title("📈 SEM Forecast Dashboard")
 st.markdown("Upload your SEM data to generate forecasts with interactive visualizations and detailed analysis.")
 
+# Initialize market conditions session state
+initialize_market_conditions_session_state()
+
 # Sidebar for file upload and controls
 st.sidebar.header("📁 Data Upload")
 uploaded_file = st.sidebar.file_uploader(
@@ -1246,7 +1316,7 @@ if uploaded_file is not None:
             metrics = calculate_summary_metrics(table)
             
             # Create tabs for different views
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Daily Dashboard", "📅 Weekly Dashboard", "📋 Data Tables", "🔮 Scenario Planning", "📈 Advanced Analytics"])
+            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Daily Dashboard", "📅 Weekly Dashboard", "📋 Data Tables", "🔮 Scenario Planning", "📈 Advanced Analytics", "🌍 Market Conditions"])
             
             with tab1:
                 st.header("Daily Forecast Dashboard")
@@ -1453,8 +1523,9 @@ if uploaded_file is not None:
                 
                 with st.expander("📖 Methodology"):
                     st.markdown("""
-                    **Elasticity-Based Modeling with Recency Weighting:**
+                    **Elasticity-Based Modeling with Market Condition Adjustments:**
                     
+                    **Budget Impact Modeling:**
                     1. **Historical Analysis**: Calculates separate elasticities for brand vs non-brand spend based on your historical data
                     2. **Recency Weighting**: Recent performance is weighted more heavily:
                        - Last 14 days get 50% boost in importance
@@ -1467,7 +1538,14 @@ if uploaded_file is not None:
                     4. **Diminishing Returns**: Uses logarithmic curves for spend increases (no diminishing effect for decreases)
                     5. **Incremental Modeling**: Applies `elasticity × ln(1 + % change)` for realistic impact calculation
                     
-                    This approach prioritizes recent performance patterns while accounting for differential channel efficiency.
+                    **Market Condition Adjustments:**
+                    1. **Economic Environment**: Recession (-25% orders) to Boom (+30% orders) based on consumer spending patterns
+                    2. **Competitive Pressure**: High competition (-20% orders) to low competition (+10% orders)
+                    3. **Industry Trends**: Declining industry (-15% orders) to expanding industry (+35% orders)
+                    4. **Combined Effects**: All market conditions multiply together for total impact
+                    5. **Channel Differential**: Clicks and impressions respond differently to market conditions than conversion
+                    
+                    This approach combines internal spend optimization with external market reality for more accurate scenarios.
                     """)
                 
                 # Scenario controls
@@ -1487,9 +1565,73 @@ if uploaded_file is not None:
                         help="Adjust non-brand budget by percentage"
                     )
                 
-                # Apply scenario if adjustments are made
-                if brand_adjustment != 0 or nonbrand_adjustment != 0:
-                    scenario_table = apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment)
+                # Market Conditions
+                st.subheader("🌍 Market Condition Scenarios")
+                st.markdown("*Adjust for external factors that impact performance regardless of spend*")
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    economic_condition = st.selectbox(
+                        "Economic Environment",
+                        ["recession", "downturn", "neutral", "growth", "boom"],
+                        index=2,
+                        help="Overall economic conditions affecting consumer spending and demand"
+                    )
+                with col2:
+                    competitive_pressure = st.selectbox(
+                        "Competitive Pressure", 
+                        ["high", "moderate", "neutral", "low"],
+                        index=2,
+                        help="Level of competitive activity and pricing pressure in your market"
+                    )
+                with col3:
+                    industry_trend = st.selectbox(
+                        "Industry Trend",
+                        ["declining", "stable", "growing", "expanding"], 
+                        index=1,
+                        help="Overall trend and growth trajectory in your industry vertical"
+                    )
+                
+                # Show market condition impact preview
+                if economic_condition != "neutral" or competitive_pressure != "neutral" or industry_trend != "stable":
+                    with st.expander("🔍 Market Condition Impact Preview"):
+                        # Calculate combined market effects
+                        temp_table = apply_market_conditions(table, economic_condition, competitive_pressure, industry_trend)
+                        if hasattr(temp_table, '_market_conditions'):
+                            conditions = temp_table._market_conditions
+                            
+                            # Calculate combined effects
+                            combined_orders = 1.0
+                            combined_clicks = 1.0
+                            combined_impressions = 1.0
+                            
+                            for condition_type, multipliers in conditions.items():
+                                combined_orders *= multipliers.get('orders', 1.0)
+                                combined_clicks *= multipliers.get('clicks', 1.0)
+                                combined_impressions *= multipliers.get('impressions', 1.0)
+                            
+                            col_a, col_b, col_c = st.columns(3)
+                            with col_a:
+                                st.metric("Orders Impact", f"{(combined_orders-1)*100:+.1f}%")
+                            with col_b:
+                                st.metric("Clicks Impact", f"{(combined_clicks-1)*100:+.1f}%")
+                            with col_c:
+                                st.metric("Impressions Impact", f"{(combined_impressions-1)*100:+.1f}%")
+                
+                # Apply scenario if adjustments are made  
+                scenario_active = (brand_adjustment != 0 or nonbrand_adjustment != 0 or 
+                                 economic_condition != "neutral" or competitive_pressure != "neutral" or industry_trend != "stable")
+                
+                if scenario_active:
+                    # Apply budget adjustments first
+                    if brand_adjustment != 0 or nonbrand_adjustment != 0:
+                        scenario_table = apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment)
+                    else:
+                        scenario_table = table.copy()
+                    
+                    # Apply market conditions
+                    if economic_condition != "neutral" or competitive_pressure != "neutral" or industry_trend != "stable":
+                        scenario_table = apply_market_conditions(scenario_table, economic_condition, competitive_pressure, industry_trend)
                     
                     # Generate scenario forecasts - pass baseline table for comparison
                     scenario_orders_fc, scenario_clicks_fc, scenario_impr_fc, scenario_metrics = generate_scenario_forecast(
@@ -1567,7 +1709,7 @@ if uploaded_file is not None:
                             st.metric("CPA Impact", "N/A", help="Insufficient data for CPA calculation")
                 
                 else:
-                    st.info("👆 Adjust the budget sliders above to see scenario forecasts")
+                    st.info("👆 Adjust the budget sliders or market conditions above to see scenario forecasts")
             
             with tab5:
                 st.header("📈 Advanced Analytics")
@@ -1627,6 +1769,375 @@ if uploaded_file is not None:
                     "training_window": "730 days",
                     "regressors": BASE_REGS + ["clicks", "impressions"]
                 })
+            
+            with tab6:
+                st.header("🌍 Market Conditions Configuration")
+                st.markdown("**Customize Impact Levels**: Adjust the percentage impact for each market condition scenario based on your business understanding.")
+                
+                # Initialize session state
+                initialize_market_conditions_session_state()
+                
+                # Reset to defaults button
+                col1, col2 = st.columns([3, 1])
+                with col2:
+                    if st.button("🔄 Reset to Defaults"):
+                        st.session_state.market_multipliers = get_default_market_multipliers()
+                        st.success("Reset to default values!")
+                        st.rerun()
+                
+                # Economic Conditions Configuration
+                st.subheader("💰 Economic Environment Impacts")
+                st.markdown("*Adjust how different economic conditions affect your business performance*")
+                
+                economic_conditions = ["recession", "downturn", "neutral", "growth", "boom"]
+                economic_descriptions = {
+                    "recession": "Severe economic downturn with reduced consumer spending",
+                    "downturn": "Economic slowdown with cautious consumer behavior", 
+                    "neutral": "Stable economic conditions (baseline)",
+                    "growth": "Positive economic growth with increased consumer confidence",
+                    "boom": "Strong economic expansion with high consumer demand"
+                }
+                
+                for i, condition in enumerate(economic_conditions):
+                    st.write(f"**{condition.title()}**: {economic_descriptions[condition]}")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    current_values = st.session_state.market_multipliers["economic_multipliers"][condition]
+                    
+                    with col1:
+                        st.write("Orders Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            orders_impact = st.slider(
+                                f"Orders Slider",
+                                min_value=0.1, max_value=2.0, 
+                                value=current_values["orders"],
+                                step=0.01,
+                                key=f"econ_{condition}_orders",
+                                help=f"Multiplier for orders during {condition} (1.0 = no change)",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            orders_input = st.number_input(
+                                f"Orders Input",
+                                min_value=0.1, max_value=2.0,
+                                value=orders_impact,
+                                step=0.01,
+                                key=f"econ_{condition}_orders_text",
+                                help="Direct input",
+                                label_visibility="collapsed"
+                            )
+                        
+                        # If text input differs from slider, update the main session state value
+                        if orders_input != orders_impact:
+                            # Update the market multipliers directly 
+                            st.session_state.market_multipliers["economic_multipliers"][condition]["orders"] = orders_input
+                            st.rerun()
+                        
+                        # Use the slider value as the final value
+                        orders_impact = orders_impact
+                        
+                    with col2:
+                        st.write("Clicks Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            clicks_impact = st.slider(
+                                f"Clicks Slider",
+                                min_value=0.1, max_value=2.0,
+                                value=current_values["clicks"], 
+                                step=0.01,
+                                key=f"econ_{condition}_clicks",
+                                help=f"Multiplier for clicks during {condition}",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            clicks_input = st.number_input(
+                                f"Clicks Input",
+                                min_value=0.1, max_value=2.0,
+                                value=clicks_impact,
+                                step=0.01,
+                                key=f"econ_{condition}_clicks_text",
+                                help="Direct input",
+                                label_visibility="collapsed"
+                            )
+                        
+                        # If text input differs from slider, update the main session state value
+                        if clicks_input != clicks_impact:
+                            st.session_state.market_multipliers["economic_multipliers"][condition]["clicks"] = clicks_input
+                            st.rerun()
+                        
+                        clicks_impact = clicks_impact
+                        
+                    with col3:
+                        st.write("Impressions Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            impressions_impact = st.slider(
+                                f"Impressions Slider", 
+                                min_value=0.1, max_value=2.0,
+                                value=current_values["impressions"],
+                                step=0.01,
+                                key=f"econ_{condition}_impressions", 
+                                help=f"Multiplier for impressions during {condition}",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            impressions_input = st.number_input(
+                                f"Impressions Input",
+                                min_value=0.1, max_value=2.0,
+                                value=impressions_impact,
+                                step=0.01,
+                                key=f"econ_{condition}_impressions_text",
+                                help="Direct input",
+                                label_visibility="collapsed"
+                            )
+                        
+                        # If text input differs from slider, update the main session state value
+                        if impressions_input != impressions_impact:
+                            st.session_state.market_multipliers["economic_multipliers"][condition]["impressions"] = impressions_input
+                            st.rerun()
+                        
+                        impressions_impact = impressions_impact
+                    
+                    # Update session state
+                    st.session_state.market_multipliers["economic_multipliers"][condition] = {
+                        "orders": orders_impact,
+                        "clicks": clicks_impact, 
+                        "impressions": impressions_impact,
+                        "cost_efficiency": current_values.get("cost_efficiency", 1.0)
+                    }
+                    
+                    st.markdown("---")
+                
+                # Competitive Pressure Configuration
+                st.subheader("⚔️ Competitive Pressure Impacts")
+                st.markdown("*Adjust how competitive market conditions affect performance*")
+                
+                competitive_levels = ["high", "moderate", "neutral", "low"]
+                competitive_descriptions = {
+                    "high": "Intense competition with aggressive competitor activities",
+                    "moderate": "Moderate competitive activity in the market",
+                    "neutral": "Normal competitive environment (baseline)", 
+                    "low": "Limited competitive pressure with market advantages"
+                }
+                
+                for condition in competitive_levels:
+                    st.write(f"**{condition.title()}**: {competitive_descriptions[condition]}")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    current_values = st.session_state.market_multipliers["competitive_multipliers"][condition]
+                    
+                    with col1:
+                        st.write("Orders Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            orders_impact = st.slider(
+                                f"Orders Slider",
+                                min_value=0.1, max_value=2.0,
+                                value=current_values["orders"],
+                                step=0.01,
+                                key=f"comp_{condition}_orders",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            orders_input = st.number_input(
+                                f"Orders Input",
+                                min_value=0.1, max_value=2.0,
+                                value=orders_impact,
+                                step=0.01,
+                                key=f"comp_{condition}_orders_text",
+                                label_visibility="collapsed"
+                            )
+                        
+                        if orders_input != orders_impact:
+                            st.session_state.market_multipliers["competitive_multipliers"][condition]["orders"] = orders_input
+                            st.rerun()
+                        
+                        orders_impact = orders_impact
+                        
+                    with col2:
+                        st.write("Clicks Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            clicks_impact = st.slider(
+                                f"Clicks Slider",
+                                min_value=0.1, max_value=2.0, 
+                                value=current_values["clicks"],
+                                step=0.01,
+                                key=f"comp_{condition}_clicks",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            clicks_input = st.number_input(
+                                f"Clicks Input",
+                                min_value=0.1, max_value=2.0,
+                                value=clicks_impact,
+                                step=0.01,
+                                key=f"comp_{condition}_clicks_text",
+                                label_visibility="collapsed"
+                            )
+                        
+                        if clicks_input != clicks_impact:
+                            st.session_state.market_multipliers["competitive_multipliers"][condition]["clicks"] = clicks_input
+                            st.rerun()
+                        
+                        clicks_impact = clicks_impact
+                        
+                    with col3:
+                        st.write("Impressions Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            impressions_impact = st.slider(
+                                f"Impressions Slider",
+                                min_value=0.1, max_value=2.0,
+                                value=current_values["impressions"], 
+                                step=0.01,
+                                key=f"comp_{condition}_impressions",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            impressions_input = st.number_input(
+                                f"Impressions Input",
+                                min_value=0.1, max_value=2.0,
+                                value=impressions_impact,
+                                step=0.01,
+                                key=f"comp_{condition}_impressions_text",
+                                label_visibility="collapsed"
+                            )
+                        
+                        if impressions_input != impressions_impact:
+                            st.session_state.market_multipliers["competitive_multipliers"][condition]["impressions"] = impressions_input
+                            st.rerun()
+                        
+                        impressions_impact = impressions_impact
+                    
+                    # Update session state
+                    st.session_state.market_multipliers["competitive_multipliers"][condition] = {
+                        "orders": orders_impact,
+                        "clicks": clicks_impact,
+                        "impressions": impressions_impact, 
+                        "cost_efficiency": current_values.get("cost_efficiency", 1.0)
+                    }
+                    
+                    st.markdown("---")
+                
+                # Industry Trend Configuration
+                st.subheader("📈 Industry Trend Impacts") 
+                st.markdown("*Adjust how industry growth trends affect your performance*")
+                
+                industry_trends = ["declining", "stable", "growing", "expanding"]
+                industry_descriptions = {
+                    "declining": "Industry in decline with shrinking market demand",
+                    "stable": "Stable industry with consistent demand (baseline)",
+                    "growing": "Growing industry with increasing market opportunities", 
+                    "expanding": "Rapidly expanding industry with high growth potential"
+                }
+                
+                for condition in industry_trends:
+                    st.write(f"**{condition.title()}**: {industry_descriptions[condition]}")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    current_values = st.session_state.market_multipliers["industry_multipliers"][condition]
+                    
+                    with col1:
+                        st.write("Orders Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            orders_impact = st.slider(
+                                f"Orders Slider",
+                                min_value=0.1, max_value=2.0,
+                                value=current_values["orders"],
+                                step=0.01, 
+                                key=f"industry_{condition}_orders",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            orders_input = st.number_input(
+                                f"Orders Input",
+                                min_value=0.1, max_value=2.0,
+                                value=orders_impact,
+                                step=0.01,
+                                key=f"industry_{condition}_orders_text",
+                                label_visibility="collapsed"
+                            )
+                        
+                        if orders_input != orders_impact:
+                            st.session_state.market_multipliers["industry_multipliers"][condition]["orders"] = orders_input
+                            st.rerun()
+                        
+                        orders_impact = orders_impact
+                        
+                    with col2:
+                        st.write("Clicks Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            clicks_impact = st.slider(
+                                f"Clicks Slider", 
+                                min_value=0.1, max_value=2.0,
+                                value=current_values["clicks"],
+                                step=0.01,
+                                key=f"industry_{condition}_clicks",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            clicks_input = st.number_input(
+                                f"Clicks Input",
+                                min_value=0.1, max_value=2.0,
+                                value=clicks_impact,
+                                step=0.01,
+                                key=f"industry_{condition}_clicks_text",
+                                label_visibility="collapsed"
+                            )
+                        
+                        if clicks_input != clicks_impact:
+                            st.session_state.market_multipliers["industry_multipliers"][condition]["clicks"] = clicks_input
+                            st.rerun()
+                        
+                        clicks_impact = clicks_impact
+                        
+                    with col3:
+                        st.write("Impressions Impact")
+                        subcol1, subcol2 = st.columns([3, 1])
+                        with subcol1:
+                            impressions_impact = st.slider(
+                                f"Impressions Slider",
+                                min_value=0.1, max_value=2.0,
+                                value=current_values["impressions"],
+                                step=0.01,
+                                key=f"industry_{condition}_impressions",
+                                label_visibility="collapsed"
+                            )
+                        with subcol2:
+                            impressions_input = st.number_input(
+                                f"Impressions Input",
+                                min_value=0.1, max_value=2.0,
+                                value=impressions_impact,
+                                step=0.01,
+                                key=f"industry_{condition}_impressions_text",
+                                label_visibility="collapsed"
+                            )
+                        
+                        if impressions_input != impressions_impact:
+                            st.session_state.market_multipliers["industry_multipliers"][condition]["impressions"] = impressions_input
+                            st.rerun()
+                        
+                        impressions_impact = impressions_impact
+                    
+                    # Update session state
+                    st.session_state.market_multipliers["industry_multipliers"][condition] = {
+                        "orders": orders_impact,
+                        "clicks": clicks_impact,
+                        "impressions": impressions_impact,
+                        "cost_efficiency": current_values.get("cost_efficiency", 1.0)
+                    }
+                    
+                    if condition != "expanding":  # Don't add separator after last item
+                        st.markdown("---")
+                
+                # Show current configuration summary
+                st.subheader("📋 Current Configuration Summary")
+                with st.expander("View All Current Multipliers"):
+                    st.json(st.session_state.market_multipliers)
 
 else:
     st.info("👆 Please upload a CSV or Excel file to get started.")
