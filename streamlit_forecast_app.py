@@ -33,7 +33,7 @@ st.set_page_config(
 # --------------------------------------------------------------------------- #
 ALLOWED_EXT = {".csv", ".xls", ".xlsx"}
 REQ_COLS = {
-    "date", "orders", "clicks", "impressions", "cost",
+    "date", "orders", "ncos", "clicks", "impressions", "cost",
     "brand_cost", "nonbrand_cost", "promo_flag",
 }
 BASE_REGS = ["brand_cost", "nonbrand_cost", "promo_flag"]
@@ -115,7 +115,7 @@ def filter_data_by_date_range(data, date_col, start_date, end_date):
     mask = (data[date_col] >= start_date) & (data[date_col] <= end_date)
     return data[mask]
 
-def create_dynamic_trendline_chart(table, orders_fc, clicks_fc, impr_fc, chart_type="daily"):
+def create_dynamic_trendline_chart(table, orders_fc, ncos_fc, clicks_fc, impr_fc, chart_type="daily"):
     """Create charts with truly dynamic trendlines that recalculate based on user-selected range"""
     
     # Date range selector using Streamlit widgets
@@ -166,14 +166,15 @@ def create_dynamic_trendline_chart(table, orders_fc, clicks_fc, impr_fc, chart_t
         # Filter all data based on selected range
         filtered_table = table[(table['ds'] >= start_ts) & (table['ds'] <= end_ts)]
         filtered_orders_fc = orders_fc[(orders_fc['ds'] >= start_ts) & (orders_fc['ds'] <= end_ts)] if orders_fc is not None else None
+        filtered_ncos_fc = ncos_fc[(ncos_fc['ds'] >= start_ts) & (ncos_fc['ds'] <= end_ts)] if ncos_fc is not None else None
         filtered_clicks_fc = clicks_fc[(clicks_fc['ds'] >= start_ts) & (clicks_fc['ds'] <= end_ts)] if clicks_fc is not None else None  
         filtered_impr_fc = impr_fc[(impr_fc['ds'] >= start_ts) & (impr_fc['ds'] <= end_ts)] if impr_fc is not None else None
         
         st.info(f"📊 Analyzing {len(filtered_table)} days of data from {start_date} to {end_date}")
         
-        return filtered_table, filtered_orders_fc, filtered_clicks_fc, filtered_impr_fc, start_ts, end_ts
+        return filtered_table, filtered_orders_fc, filtered_ncos_fc, filtered_clicks_fc, filtered_impr_fc, start_ts, end_ts
     
-    return table, orders_fc, clicks_fc, impr_fc, None, None
+    return table, orders_fc, ncos_fc, clicks_fc, impr_fc, None, None
 
 def create_chart_with_hierarchical_controls(fig, full_data, chart_key):
     """Create chart with hierarchical filtering: Slider > Quick Select > Date Range"""
@@ -298,16 +299,17 @@ def create_single_forecast_chart(data, metric, forecast_data=None, original_data
     return fig
 
 def create_enhanced_forecast_charts(filtered_table, filtered_orders_fc, filtered_clicks_fc, filtered_impr_fc, 
-                                  original_table, original_orders_fc, original_clicks_fc, original_impr_fc):
+                                  original_table, original_orders_fc, original_clicks_fc, original_impr_fc, metric_name="orders"):
     """Create forecast charts with enhanced hierarchical filtering capabilities"""
     colors_map = {
         'orders': {'actual': 'black', 'forecast': 'blue', 'ci': 'rgba(0,100,80,0.2)'},
+        'ncos': {'actual': 'black', 'forecast': 'orange', 'ci': 'rgba(255,165,0,0.2)'},
         'clicks': {'actual': 'black', 'forecast': 'green', 'ci': 'rgba(0,100,80,0.2)'},
         'impressions': {'actual': 'black', 'forecast': 'red', 'ci': 'rgba(0,100,80,0.2)'}
     }
     
-    fig_orders = create_single_forecast_chart(filtered_table, 'orders', None, original_table, 
-                                           colors_map['orders'], True, "Hierarchical ")
+    fig_orders = create_single_forecast_chart(filtered_table, metric_name, None, original_table, 
+                                           colors_map[metric_name], True, "Hierarchical ")
     fig_clicks = create_single_forecast_chart(filtered_table, 'clicks', filtered_clicks_fc, original_clicks_fc,
                                            colors_map['clicks'], True, "Hierarchical ")
     fig_impressions = create_single_forecast_chart(filtered_table, 'impressions', filtered_impr_fc, original_impr_fc,
@@ -370,8 +372,9 @@ def prophet_forecast(df_train, target, regs, df_future, optimize_hyperparams=Tru
         
         # Add new features to regressors list (only if they exist in both datasets)
         enhanced_regs = regs.copy()
-        potential_features = ['cost_per_order', 'brand_share', 'promo_brand_effect', 'orders_per_dollar', 
-                             'is_weekend', 'cost_concentration', f'{target}_ma_7']
+        potential_features = ['cost_per_order', 'cost_per_ncos', 'brand_share', 'promo_brand_effect', 
+                             'orders_per_dollar', 'ncos_per_dollar', 'ncos_share', 'is_weekend', 
+                             'cost_concentration', f'{target}_ma_7']
         
         for feat in potential_features:
             if (feat in df_train_enhanced.columns and feat in df_future_enhanced.columns and
@@ -497,18 +500,18 @@ def run_sem_pipeline(df_full, enable_optimization=True):
         progress_bar = st.progress(0, text="🚀 Starting forecasting pipeline...")
         
         # Generate clicks forecast
-        progress_bar.progress(25, text="🔧 Training clicks model...")
+        progress_bar.progress(20, text="🔧 Training clicks model...")
         clicks_fc = prophet_forecast(train, "clicks", BASE_REGS, future, 
                                    optimize_hyperparams=enable_optimization, 
                                    use_features=enable_optimization)
         
         # Generate impressions forecast  
-        progress_bar.progress(50, text="🔧 Training impressions model...")
+        progress_bar.progress(40, text="🔧 Training impressions model...")
         impr_fc = prophet_forecast(train, "impressions", BASE_REGS, future,
                                  optimize_hyperparams=enable_optimization,
                                  use_features=enable_optimization)
         
-        progress_bar.progress(75, text="🔧 Training orders model...")
+        progress_bar.progress(60, text="🔧 Training orders model...")
         
         # Orders forecast using predicted clicks/impressions
         fut_orders = (
@@ -522,6 +525,15 @@ def run_sem_pipeline(df_full, enable_optimization=True):
             use_features=enable_optimization
         )
         
+        progress_bar.progress(80, text="🔧 Training NCOS model...")
+        
+        # NCOS forecast using same inputs as orders
+        ncos_fc = prophet_forecast(
+            train, "ncos", BASE_REGS + ["clicks", "impressions"], fut_orders,
+            optimize_hyperparams=enable_optimization,
+            use_features=enable_optimization
+        )
+        
         progress_bar.progress(100, text="✅ Forecasting complete!")
     
     # Clear the progress container
@@ -529,9 +541,11 @@ def run_sem_pipeline(df_full, enable_optimization=True):
     
     # Combined results table - start with historical data and add future data
     table = (
-        hist[["ds", "cost", "orders", "clicks", "impressions", "brand_cost", "nonbrand_cost"]]
-        .rename(columns={"orders": "actual_orders", "clicks": "actual_clicks", "impressions": "actual_impressions"})
+        hist[["ds", "cost", "orders", "ncos", "clicks", "impressions", "brand_cost", "nonbrand_cost"]]
+        .rename(columns={"orders": "actual_orders", "ncos": "actual_ncos", 
+                        "clicks": "actual_clicks", "impressions": "actual_impressions"})
         .merge(orders_fc[["ds", "orders", "orders_lower", "orders_upper"]], on="ds", how="outer")
+        .merge(ncos_fc[["ds", "ncos", "ncos_lower", "ncos_upper"]], on="ds", how="outer")
         .merge(clicks_fc[["ds", "clicks", "clicks_lower", "clicks_upper"]], on="ds", how="outer")
         .merge(impr_fc[["ds", "impressions", "impressions_lower", "impressions_upper"]], on="ds", how="outer")
         .sort_values("ds")
@@ -554,7 +568,7 @@ def run_sem_pipeline(df_full, enable_optimization=True):
             table.loc[idx, 'brand_cost'] = future_brand_nonbrand.loc[ds_value, 'brand_cost']
             table.loc[idx, 'nonbrand_cost'] = future_brand_nonbrand.loc[ds_value, 'nonbrand_cost']
     
-    return table, orders_fc, clicks_fc, impr_fc
+    return table, orders_fc, ncos_fc, clicks_fc, impr_fc
 
 def create_forecast_charts(table, orders_fc, clicks_fc, impr_fc):
     """Create interactive Plotly charts with dynamic trendlines"""
@@ -587,6 +601,15 @@ def calculate_summary_metrics(table):
         "confidence_range_orders": (forecast_data["orders_upper"].sum() - forecast_data["orders_lower"].sum()),
     }
     
+    # Add NCOS metrics if available
+    if "ncos" in forecast_data.columns:
+        metrics.update({
+            "total_forecast_ncos": forecast_data["ncos"].sum(),
+            "avg_daily_ncos": forecast_data["ncos"].mean(),
+            "forecast_ncos_cpa": (forecast_data["planned_cost"].sum() / forecast_data["ncos"].sum()) if forecast_data["ncos"].sum() > 0 else 0,
+            "confidence_range_ncos": (forecast_data["ncos_upper"].sum() - forecast_data["ncos_lower"].sum()) if "ncos_upper" in forecast_data.columns else 0,
+        })
+    
     return metrics
 
 def aggregate_data_by_period(table, period='W'):
@@ -598,9 +621,9 @@ def aggregate_data_by_period(table, period='W'):
     aggregated_table[period_col] = aggregated_table['ds'].dt.to_period(period).dt.start_time
     
     # Sum columns - but handle NaN values properly
-    sum_cols = ['actual_orders', 'orders', 'actual_clicks', 'clicks', 'actual_impressions', 
+    sum_cols = ['actual_orders', 'orders', 'actual_ncos', 'ncos', 'actual_clicks', 'clicks', 'actual_impressions', 
                 'impressions', 'cost', 'planned_cost', 'brand_cost', 'nonbrand_cost',
-                'orders_lower', 'orders_upper', 'clicks_lower', 'clicks_upper', 
+                'orders_lower', 'orders_upper', 'ncos_lower', 'ncos_upper', 'clicks_lower', 'clicks_upper', 
                 'impressions_lower', 'impressions_upper']
     
     # Group by period and aggregate
@@ -666,6 +689,13 @@ def calculate_marketing_metrics(display_table):
         if 'orders' in display_table.columns or 'actual_orders' in display_table.columns:
             display_table['CPO'] = display_table.apply(
                 lambda row: calculate_metric(row, ('cost', 'planned_cost'), ('actual_orders', 'orders')), 
+                axis=1
+            )
+        
+        # NCOS CPO (Cost Per New Customer Order)
+        if 'ncos' in display_table.columns or 'actual_ncos' in display_table.columns:
+            display_table['NCOS_CPO'] = display_table.apply(
+                lambda row: calculate_metric(row, ('cost', 'planned_cost'), ('actual_ncos', 'ncos')), 
                 axis=1
             )
         
@@ -822,6 +852,17 @@ def add_basic_features(df):
         df['cost_per_order'] = df['cost'] / (df['orders'] + 1e-6)
         df['orders_per_dollar'] = df['orders'] / (df['cost'] + 1e-6)
     
+    # NCOS efficiency metrics
+    if 'cost' in df.columns and 'ncos' in df.columns:
+        df['cost_per_ncos'] = df['cost'] / (df['ncos'] + 1e-6)
+        df['ncos_per_dollar'] = df['ncos'] / (df['cost'] + 1e-6)
+    
+    # Orders vs NCOS relationships
+    if 'orders' in df.columns and 'ncos' in df.columns:
+        df['ncos_share'] = df['ncos'] / (df['orders'] + 1e-6)
+        df['returning_orders'] = df['orders'] - df['ncos']
+        df['returning_orders'] = df['returning_orders'].clip(lower=0)
+    
     # Brand vs non-brand ratios and interactions
     if 'brand_cost' in df.columns and 'nonbrand_cost' in df.columns:
         total_cost = df['brand_cost'] + df['nonbrand_cost']
@@ -834,12 +875,12 @@ def add_basic_features(df):
             df['promo_nonbrand_effect'] = df['promo_flag'] * df['nonbrand_cost']
     
     # Simple lag features (most impactful)
-    for col in ['orders', 'clicks', 'impressions']:
+    for col in ['orders', 'ncos', 'clicks', 'impressions']:
         if col in df.columns:
             df[f'{col}_lag_7'] = df[col].shift(7)  # Weekly lag
     
     # Rolling averages (7-day smoothing)
-    for col in ['orders', 'cost', 'brand_cost', 'nonbrand_cost']:
+    for col in ['orders', 'ncos', 'cost', 'brand_cost', 'nonbrand_cost']:
         if col in df.columns:
             df[f'{col}_ma_7'] = df[col].rolling(7, min_periods=1).mean()
     
@@ -1509,17 +1550,18 @@ def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_or
     
     return fig
 
-def create_weekly_forecast_charts(weekly_table, title_suffix="Weekly"):
+def create_weekly_forecast_charts(weekly_table, title_suffix="Weekly", primary_metric="orders"):
     """Create weekly forecast charts using consolidated chart creation function"""
     colors_map = {
         'orders': {'actual': 'black', 'forecast': 'blue', 'ci': 'rgba(0,100,80,0.2)'},
+        'ncos': {'actual': 'black', 'forecast': 'orange', 'ci': 'rgba(255,165,0,0.2)'},
         'clicks': {'actual': 'black', 'forecast': 'green', 'ci': 'rgba(0,128,0,0.2)'},
         'impressions': {'actual': 'black', 'forecast': 'red', 'ci': 'rgba(255,0,0,0.2)'}
     }
     
     # Create charts with custom titles and axis labels for weekly view
-    fig_orders = create_single_forecast_chart(weekly_table, 'orders', None, weekly_table, 
-                                           colors_map['orders'], True, f"{title_suffix} ")
+    fig_orders = create_single_forecast_chart(weekly_table, primary_metric, None, weekly_table, 
+                                           colors_map[primary_metric], True, f"{title_suffix} ")
     fig_orders.update_layout(xaxis_title="Week Starting")
     
     fig_clicks = create_single_forecast_chart(weekly_table, 'clicks', None, weekly_table,
@@ -1585,7 +1627,7 @@ if uploaded_file is not None:
         # Run forecasting pipeline
         pipeline_text = "🔮 Generating optimized forecasts..." if enable_optimization else "🔮 Generating forecasts..."
         with st.spinner(pipeline_text):
-            table, orders_fc, clicks_fc, impr_fc = run_sem_pipeline(df, enable_optimization)
+            table, orders_fc, ncos_fc, clicks_fc, impr_fc = run_sem_pipeline(df, enable_optimization)
         
         if table is not None:
             # Calculate metrics
@@ -1598,12 +1640,20 @@ if uploaded_file is not None:
                 st.header("Daily Forecast Dashboard")
                 
                 # Dynamic date range selector and data filtering
-                filtered_table, filtered_orders_fc, filtered_clicks_fc, filtered_impr_fc, start_ts, end_ts = create_dynamic_trendline_chart(
-                    table, orders_fc, clicks_fc, impr_fc, "daily"
+                filtered_table, filtered_orders_fc, filtered_ncos_fc, filtered_clicks_fc, filtered_impr_fc, start_ts, end_ts = create_dynamic_trendline_chart(
+                    table, orders_fc, ncos_fc, clicks_fc, impr_fc, "daily"
                 )
                 
                 # Calculate metrics for filtered data
                 filtered_metrics = calculate_summary_metrics(filtered_table)
+                
+                # Metric selector toggle
+                metric_option = st.radio(
+                    "Select metric to display:",
+                    options=["Orders", "NCOS (New Customer Orders)"],
+                    horizontal=True,
+                    key="daily_metric_selector"
+                )
                 
                 # Key metrics row
                 if filtered_metrics:
@@ -1611,23 +1661,54 @@ if uploaded_file is not None:
                     with col1:
                         st.metric("Forecast Period", f"{filtered_metrics['forecast_period_days']} days")
                     with col2:
-                        st.metric("Total Forecast Orders", f"{filtered_metrics['total_forecast_orders']:,.0f}")
+                        # Show selected metric (Orders or NCOS)
+                        if metric_option == "Orders":
+                            st.metric("Total Forecast Orders", f"{filtered_metrics['total_forecast_orders']:,.0f}")
+                        else:  # NCOS
+                            if 'total_forecast_ncos' in filtered_metrics:
+                                st.metric("Total Forecast NCOS", f"{filtered_metrics['total_forecast_ncos']:,.0f}")
+                            else:
+                                st.metric("Total Forecast NCOS", "Not available")
                     with col3:
-                        st.metric("Avg Daily Orders", f"{filtered_metrics['avg_daily_orders']:,.0f}")
+                        if metric_option == "Orders":
+                            st.metric("Avg Daily Orders", f"{filtered_metrics['avg_daily_orders']:,.0f}")
+                        else:  # NCOS
+                            if 'avg_daily_ncos' in filtered_metrics:
+                                st.metric("Avg Daily NCOS", f"{filtered_metrics['avg_daily_ncos']:,.0f}")
+                            else:
+                                st.metric("Avg Daily NCOS", "Not available")
                     with col4:
                         if filtered_metrics['total_planned_cost'] > 0:
-                            st.metric("Forecast CPA", f"${filtered_metrics['forecast_cpa']:,.2f}")
+                            if metric_option == "Orders":
+                                st.metric("Forecast CPA", f"${filtered_metrics['forecast_cpa']:,.2f}")
+                            else:  # NCOS
+                                if 'forecast_ncos_cpa' in filtered_metrics and filtered_metrics['forecast_ncos_cpa'] > 0:
+                                    st.metric("Forecast NCOS CPA", f"${filtered_metrics['forecast_ncos_cpa']:,.2f}")
+                                else:
+                                    st.metric("Forecast NCOS CPA", "Not available")
                         else:
                             st.metric("Total Planned Cost", "Not available")
                 
                 # Charts with hierarchical dynamic trendlines
-                fig_orders, fig_clicks, fig_impressions = create_enhanced_forecast_charts(
-                    filtered_table, filtered_orders_fc, filtered_clicks_fc, filtered_impr_fc,
-                    table, orders_fc, clicks_fc, impr_fc
-                )
+                st.subheader("📈 Forecast Charts")
+                if metric_option == "Orders":
+                    fig_orders, fig_clicks, fig_impressions = create_enhanced_forecast_charts(
+                        filtered_table, filtered_orders_fc, filtered_clicks_fc, filtered_impr_fc,
+                        table, orders_fc, clicks_fc, impr_fc
+                    )
+                    chart_data_fc = filtered_orders_fc
+                    chart_metric = "orders"
+                else:  # NCOS
+                    fig_orders, fig_clicks, fig_impressions = create_enhanced_forecast_charts(
+                        filtered_table, filtered_ncos_fc, filtered_clicks_fc, filtered_impr_fc,
+                        table, ncos_fc, clicks_fc, impr_fc, metric_name="ncos"
+                    )
+                    chart_data_fc = filtered_ncos_fc
+                    chart_metric = "ncos"
                 
                 # Display charts
-                st.plotly_chart(fig_orders, use_container_width=True, key="orders_chart")
+                chart_title = "Orders" if metric_option == "Orders" else "NCOS (New Customer Orders)"
+                st.plotly_chart(fig_orders, use_container_width=True, key=f"{chart_metric}_chart")
                 
                 st.plotly_chart(fig_clicks, use_container_width=True, key="clicks_chart")
                 st.plotly_chart(fig_impressions, use_container_width=True, key="impressions_chart")
@@ -1638,37 +1719,74 @@ if uploaded_file is not None:
             with tab2:
                 st.header("Weekly Forecast Dashboard")
                 
+                # Metric selector toggle for weekly view
+                weekly_metric_option = st.radio(
+                    "Select metric to display:",
+                    options=["Orders", "NCOS (New Customer Orders)"],
+                    horizontal=True,
+                    key="weekly_metric_selector"
+                )
+                
                 # Aggregate data to weekly view
                 weekly_table = aggregate_weekly_data(table)
                 
                 # Dynamic date range selector for weekly data
-                filtered_weekly_table, _, _, _, weekly_start_ts, weekly_end_ts = create_dynamic_trendline_chart(
-                    weekly_table, None, None, None, "weekly"
+                filtered_weekly_table, _, _, _, _, weekly_start_ts, weekly_end_ts = create_dynamic_trendline_chart(
+                    weekly_table, None, ncos_fc, None, None, "weekly"
                 )
                 
                 # Weekly metrics for filtered data
-                last_actual_weekly = filtered_weekly_table[filtered_weekly_table["actual_orders"].notna()]["ds"].max() if not filtered_weekly_table[filtered_weekly_table["actual_orders"].notna()].empty else None
-                weekly_forecast_data = filtered_weekly_table[filtered_weekly_table["ds"] > last_actual_weekly].copy() if last_actual_weekly is not None else filtered_weekly_table[filtered_weekly_table["orders"].notna()].copy()
+                weekly_metric_col = "orders" if weekly_metric_option == "Orders" else "ncos"
+                weekly_actual_col = f"actual_{weekly_metric_col}"
+                
+                # Check if the actual column exists, otherwise use the base column for filtering
+                if weekly_actual_col in filtered_weekly_table.columns:
+                    last_actual_weekly = filtered_weekly_table[filtered_weekly_table[weekly_actual_col].notna()]["ds"].max() if not filtered_weekly_table[filtered_weekly_table[weekly_actual_col].notna()].empty else None
+                else:
+                    # Fallback to using actual_orders for determining the split point
+                    last_actual_weekly = filtered_weekly_table[filtered_weekly_table["actual_orders"].notna()]["ds"].max() if not filtered_weekly_table[filtered_weekly_table["actual_orders"].notna()].empty else None
+                
+                weekly_forecast_data = filtered_weekly_table[filtered_weekly_table["ds"] > last_actual_weekly].copy() if last_actual_weekly is not None else filtered_weekly_table[filtered_weekly_table[weekly_metric_col].notna()].copy()
                 
                 if not weekly_forecast_data.empty:
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Forecast Period", f"{len(weekly_forecast_data)} weeks")
-                    with col2:
-                        st.metric("Total Forecast Orders", f"{weekly_forecast_data['orders'].sum():,.0f}")
-                    with col3:
-                        st.metric("Avg Weekly Orders", f"{weekly_forecast_data['orders'].mean():,.0f}")
-                    with col4:
-                        if 'planned_cost' in weekly_forecast_data.columns and weekly_forecast_data['planned_cost'].sum() > 0:
-                            weekly_cpa = weekly_forecast_data['planned_cost'].sum() / weekly_forecast_data['orders'].sum()
-                            st.metric("Weekly Forecast CPA", f"${weekly_cpa:,.2f}")
-                        else:
-                            st.metric("Weekly Planned Cost", "Not available")
+                    # Check if the selected metric column exists in the data
+                    if weekly_metric_col not in weekly_forecast_data.columns:
+                        st.warning(f"⚠️ {weekly_metric_col.upper()} data not available in weekly view. Please ensure your data includes the {weekly_metric_col} column.")
+                    else:
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Forecast Period", f"{len(weekly_forecast_data)} weeks")
+                        with col2:
+                            metric_label = "Total Forecast Orders" if weekly_metric_option == "Orders" else "Total Forecast NCOS"
+                            st.metric(metric_label, f"{weekly_forecast_data[weekly_metric_col].sum():,.0f}")
+                        with col3:
+                            avg_label = "Avg Weekly Orders" if weekly_metric_option == "Orders" else "Avg Weekly NCOS"
+                            st.metric(avg_label, f"{weekly_forecast_data[weekly_metric_col].mean():,.0f}")
+                        with col4:
+                            if 'planned_cost' in weekly_forecast_data.columns and weekly_forecast_data['planned_cost'].sum() > 0:
+                                weekly_cpa = weekly_forecast_data['planned_cost'].sum() / weekly_forecast_data[weekly_metric_col].sum()
+                                cpa_label = "Weekly Forecast CPA" if weekly_metric_option == "Orders" else "Weekly Forecast CPA (NCOS)"
+                                st.metric(cpa_label, f"${weekly_cpa:,.2f}")
+                            else:
+                                st.metric("Weekly Planned Cost", "Not available")
                 
                 # Weekly Charts with truly dynamic trendlines based on filtered data
-                fig_orders_weekly, fig_clicks_weekly, fig_impressions_weekly = create_weekly_forecast_charts(filtered_weekly_table, "Weekly")
-                
-                st.plotly_chart(fig_orders_weekly, use_container_width=True, key="weekly_orders_chart")
+                if weekly_metric_col in filtered_weekly_table.columns:
+                    fig_orders_weekly, fig_clicks_weekly, fig_impressions_weekly = create_weekly_forecast_charts(
+                        filtered_weekly_table, "Weekly", primary_metric=weekly_metric_col
+                    )
+                    
+                    chart_key = f"weekly_{weekly_metric_col}_chart"
+                    st.plotly_chart(fig_orders_weekly, use_container_width=True, key=chart_key)
+                else:
+                    # Fallback to orders if NCOS is not available
+                    fig_orders_weekly, fig_clicks_weekly, fig_impressions_weekly = create_weekly_forecast_charts(
+                        filtered_weekly_table, "Weekly", primary_metric="orders"
+                    )
+                    
+                    st.plotly_chart(fig_orders_weekly, use_container_width=True, key="weekly_orders_chart")
+                    if weekly_metric_col == "ncos":
+                        st.info("💡 Showing Orders chart as NCOS data is not available in the weekly aggregation.")
                 
                 st.plotly_chart(fig_clicks_weekly, use_container_width=True, key="weekly_clicks_chart")
                 st.plotly_chart(fig_impressions_weekly, use_container_width=True, key="weekly_impressions_chart")
@@ -1770,8 +1888,8 @@ if uploaded_file is not None:
                             lambda x: f"${x:,.0f}" if pd.notnull(x) else ""
                         )
                 
-                # Format CPO, CPC, and CPM columns
-                for col in ["CPO", "CPC", "CPM"]:
+                # Format CPO, CPC, CPM, and NCOS_CPO columns
+                for col in ["CPO", "NCOS_CPO", "CPC", "CPM"]:
                     if col in display_table.columns:
                         display_table[col] = display_table[col].apply(
                             lambda x: f"${x:.2f}" if pd.notnull(x) else ""
