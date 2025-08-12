@@ -971,23 +971,45 @@ def apply_budget_scenario(table, brand_adjustment, nonbrand_adjustment):
     
     return scenario_table
 
-def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30, confidence_level=0.9, n_bootstrap=1000):
+def calculate_historical_elasticities(table, metric='orders', recency_days=14, decay_half_life=30, confidence_level=0.9, n_bootstrap=1000):
     """Calculate brand vs non-brand elasticities from historical data with recency weighting and confidence intervals"""
     
-    # Get historical data only
-    hist_data = table[table["actual_orders"].notna()].copy()
+    # Determine which metric to use (orders or ncos)
+    if metric == 'ncos' and 'actual_ncos' in table.columns:
+        target_col = 'actual_ncos'
+        metric_name = 'ncos'
+    else:
+        target_col = 'actual_orders'
+        metric_name = 'orders'
+    
+    # Get historical data only - filter based on the target metric
+    hist_data = table[table[target_col].notna()].copy()
     
     if len(hist_data) < 10:  # Need sufficient data points
         # Return default elasticities if insufficient data
-        return {
-            'brand_elasticity': 0.15,      # Brand typically has higher elasticity
-            'nonbrand_elasticity': 0.08,   # Non-brand typically lower elasticity  
-            'brand_share': 0.7,            # Assume brand is 70% of spend
-            'baseline_orders_per_brand_dollar': 0.02,
-            'baseline_orders_per_nonbrand_dollar': 0.01,
-            'recency_weighted': False,
-            'confidence_intervals': False
-        }
+        # NCOS typically has lower elasticity than orders since it's a subset
+        if metric_name == 'ncos':
+            return {
+                'brand_elasticity': 0.08,      # NCOS typically lower elasticity than orders
+                'nonbrand_elasticity': 0.04,   # Even lower for non-brand NCOS
+                'brand_share': 0.7,            # Assume brand is 70% of spend
+                'baseline_orders_per_brand_dollar': 0.01,
+                'baseline_orders_per_nonbrand_dollar': 0.005,
+                'recency_weighted': False,
+                'confidence_intervals': False,
+                'metric_type': 'ncos'
+            }
+        else:
+            return {
+                'brand_elasticity': 0.15,      # Brand typically has higher elasticity
+                'nonbrand_elasticity': 0.08,   # Non-brand typically lower elasticity  
+                'brand_share': 0.7,            # Assume brand is 70% of spend
+                'baseline_orders_per_brand_dollar': 0.02,
+                'baseline_orders_per_nonbrand_dollar': 0.01,
+                'recency_weighted': False,
+                'confidence_intervals': False,
+                'metric_type': 'orders'
+            }
     
     # Sort by date and calculate recency weights
     hist_data = hist_data.sort_values('ds')
@@ -1052,10 +1074,19 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
             corr = weighted_correlation(boot_cost, boot_orders, boot_weights)
             
             # Convert to elasticity (same logic as main calculation)
-            if 'brand' in str(cost_data.name).lower():
-                elasticity = abs(corr) * 0.22  # Brand multiplier
+            # Check if we're working with NCOS based on column name context
+            if 'ncos' in str(orders_data.name).lower() if hasattr(orders_data, 'name') else False:
+                # NCOS elasticity multipliers (lower than orders)
+                if 'brand' in str(cost_data.name).lower():
+                    elasticity = abs(corr) * 0.12  # NCOS Brand multiplier
+                else:
+                    elasticity = abs(corr) * 0.08  # NCOS Non-brand multiplier
             else:
-                elasticity = abs(corr) * 0.17  # Non-brand multiplier
+                # Standard orders elasticity multipliers
+                if 'brand' in str(cost_data.name).lower():
+                    elasticity = abs(corr) * 0.22  # Brand multiplier
+                else:
+                    elasticity = abs(corr) * 0.17  # Non-brand multiplier
             
             elasticities.append(elasticity)
         
@@ -1077,32 +1108,42 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
         # Use separate brand_cost column if available
         brand_corr = weighted_correlation(
             hist_data['brand_cost'].values,
-            hist_data['actual_orders'].values,
+            hist_data[target_col].values,
             hist_data['recency_weight'].values
         )
         
         # Calculate bootstrap confidence intervals
         hist_data['brand_cost'].name = 'brand_cost'  # Ensure name is set for bootstrap function
         brand_elasticity_boot, brand_lower_ci, brand_upper_ci = bootstrap_elasticity(
-            hist_data['brand_cost'], hist_data['actual_orders'], hist_data['recency_weight'], n_bootstrap
+            hist_data['brand_cost'], hist_data[target_col], hist_data['recency_weight'], n_bootstrap
         )
         
         # Debug: Add fallback to simple correlation if weighted fails
         if brand_corr == 0 or np.isnan(brand_corr):
-            brand_corr_simple = hist_data['brand_cost'].corr(hist_data['actual_orders'])
+            brand_corr_simple = hist_data['brand_cost'].corr(hist_data[target_col])
             brand_corr = brand_corr_simple if not np.isnan(brand_corr_simple) else 0
         
-        brand_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
+        brand_mean_orders = np.average(hist_data[target_col], weights=hist_data['recency_weight'])
         brand_mean_cost = np.average(hist_data['brand_cost'], weights=hist_data['recency_weight'])
         
         if brand_mean_orders > 0 and brand_mean_cost > 0:
-            brand_elasticity = abs(brand_corr) * 0.22
+            # Adjust elasticity multiplier based on metric type
+            if metric_name == 'ncos':
+                brand_elasticity = abs(brand_corr) * 0.12  # Lower elasticity for NCOS
+            else:
+                brand_elasticity = abs(brand_corr) * 0.22  # Standard elasticity for orders
             elasticities['baseline_orders_per_brand_dollar'] = brand_mean_orders / brand_mean_cost
         else:
-            brand_elasticity = 0.15
-            elasticities['baseline_orders_per_brand_dollar'] = 0.02
-            brand_lower_ci = 0.05
-            brand_upper_ci = 0.25
+            if metric_name == 'ncos':
+                brand_elasticity = 0.08
+                elasticities['baseline_orders_per_brand_dollar'] = 0.01
+                brand_lower_ci = 0.02
+                brand_upper_ci = 0.15
+            else:
+                brand_elasticity = 0.15
+                elasticities['baseline_orders_per_brand_dollar'] = 0.02
+                brand_lower_ci = 0.05
+                brand_upper_ci = 0.25
         
         # Store confidence intervals
         elasticities['brand_elasticity_lower_ci'] = brand_lower_ci
@@ -1116,68 +1157,94 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
         # Fallback: use total cost as proxy for brand cost correlation
         total_cost_corr = weighted_correlation(
             hist_data['cost'].values,
-            hist_data['actual_orders'].values,
+            hist_data[target_col].values,
             hist_data['recency_weight'].values
         )
         
         # Bootstrap for total cost (proxy for brand)
         hist_data['cost'].name = 'total_cost'
         _, total_lower_ci, total_upper_ci = bootstrap_elasticity(
-            hist_data['cost'], hist_data['actual_orders'], hist_data['recency_weight'], n_bootstrap
+            hist_data['cost'], hist_data[target_col], hist_data['recency_weight'], n_bootstrap
         )
         
-        total_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
+        total_mean_orders = np.average(hist_data[target_col], weights=hist_data['recency_weight'])
         total_mean_cost = np.average(hist_data['cost'], weights=hist_data['recency_weight'])
         
         if total_mean_orders > 0 and total_mean_cost > 0:
             # Brand is typically more elastic than total, so boost the correlation
-            brand_elasticity = abs(total_cost_corr) * 0.28  # Higher multiplier for brand
+            # Adjust multiplier based on metric type
+            if metric_name == 'ncos':
+                brand_elasticity = abs(total_cost_corr) * 0.15  # Lower multiplier for NCOS brand
+            else:
+                brand_elasticity = abs(total_cost_corr) * 0.28  # Higher multiplier for orders brand
             elasticities['baseline_orders_per_brand_dollar'] = total_mean_orders / total_mean_cost
             # Adjust confidence intervals for brand (higher than total cost)
             elasticities['brand_elasticity_lower_ci'] = total_lower_ci * 1.2
             elasticities['brand_elasticity_upper_ci'] = total_upper_ci * 1.2
         else:
+            if metric_name == 'ncos':
+                brand_elasticity = 0.08
+                elasticities['baseline_orders_per_brand_dollar'] = 0.01
+                elasticities['brand_elasticity_lower_ci'] = 0.02
+                elasticities['brand_elasticity_upper_ci'] = 0.15
+            else:
+                brand_elasticity = 0.15
+                elasticities['baseline_orders_per_brand_dollar'] = 0.02
+                elasticities['brand_elasticity_lower_ci'] = 0.05
+                elasticities['brand_elasticity_upper_ci'] = 0.25
+    else:
+        if metric_name == 'ncos':
+            brand_elasticity = 0.08
+            elasticities['baseline_orders_per_brand_dollar'] = 0.01
+            elasticities['brand_elasticity_lower_ci'] = 0.02
+            elasticities['brand_elasticity_upper_ci'] = 0.15
+        else:
             brand_elasticity = 0.15
             elasticities['baseline_orders_per_brand_dollar'] = 0.02
             elasticities['brand_elasticity_lower_ci'] = 0.05
             elasticities['brand_elasticity_upper_ci'] = 0.25
-    else:
-        brand_elasticity = 0.15
-        elasticities['baseline_orders_per_brand_dollar'] = 0.02
-        elasticities['brand_elasticity_lower_ci'] = 0.05
-        elasticities['brand_elasticity_upper_ci'] = 0.25
     
     # Non-brand elasticity calculation with recency weighting and confidence intervals
     if 'nonbrand_cost' in hist_data.columns and hist_data['nonbrand_cost'].var() > 0:
         # Use separate nonbrand_cost column if available
         nonbrand_corr = weighted_correlation(
             hist_data['nonbrand_cost'].values,
-            hist_data['actual_orders'].values,
+            hist_data[target_col].values,
             hist_data['recency_weight'].values
         )
         
         # Calculate bootstrap confidence intervals
         hist_data['nonbrand_cost'].name = 'nonbrand_cost'
         nonbrand_elasticity_boot, nonbrand_lower_ci, nonbrand_upper_ci = bootstrap_elasticity(
-            hist_data['nonbrand_cost'], hist_data['actual_orders'], hist_data['recency_weight'], n_bootstrap
+            hist_data['nonbrand_cost'], hist_data[target_col], hist_data['recency_weight'], n_bootstrap
         )
         
         # Debug: Add fallback to simple correlation if weighted fails
         if nonbrand_corr == 0 or np.isnan(nonbrand_corr):
-            nonbrand_corr_simple = hist_data['nonbrand_cost'].corr(hist_data['actual_orders'])
+            nonbrand_corr_simple = hist_data['nonbrand_cost'].corr(hist_data[target_col])
             nonbrand_corr = nonbrand_corr_simple if not np.isnan(nonbrand_corr_simple) else 0
         
-        nonbrand_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
+        nonbrand_mean_orders = np.average(hist_data[target_col], weights=hist_data['recency_weight'])
         nonbrand_mean_cost = np.average(hist_data['nonbrand_cost'], weights=hist_data['recency_weight'])
         
         if nonbrand_mean_orders > 0 and nonbrand_mean_cost > 0:
-            nonbrand_elasticity = abs(nonbrand_corr) * 0.17
+            # Adjust elasticity multiplier based on metric type
+            if metric_name == 'ncos':
+                nonbrand_elasticity = abs(nonbrand_corr) * 0.08  # Lower elasticity for NCOS nonbrand
+            else:
+                nonbrand_elasticity = abs(nonbrand_corr) * 0.17  # Standard elasticity for orders nonbrand
             elasticities['baseline_orders_per_nonbrand_dollar'] = nonbrand_mean_orders / nonbrand_mean_cost
         else:
-            nonbrand_elasticity = 0.08
-            elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
-            nonbrand_lower_ci = 0.02
-            nonbrand_upper_ci = 0.15
+            if metric_name == 'ncos':
+                nonbrand_elasticity = 0.04
+                elasticities['baseline_orders_per_nonbrand_dollar'] = 0.005
+                nonbrand_lower_ci = 0.01
+                nonbrand_upper_ci = 0.08
+            else:
+                nonbrand_elasticity = 0.08
+                elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
+                nonbrand_lower_ci = 0.02
+                nonbrand_upper_ci = 0.15
         
         # Store confidence intervals
         elasticities['nonbrand_elasticity_lower_ci'] = nonbrand_lower_ci
@@ -1191,7 +1258,7 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
         # Fallback: use total cost as proxy for nonbrand cost correlation  
         total_cost_corr = weighted_correlation(
             hist_data['cost'].values,
-            hist_data['actual_orders'].values,
+            hist_data[target_col].values,
             hist_data['recency_weight'].values
         )
         
@@ -1199,29 +1266,45 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
         if 'cost' in hist_data.columns:
             hist_data['cost'].name = 'total_cost_nonbrand'
             _, total_lower_ci_nb, total_upper_ci_nb = bootstrap_elasticity(
-                hist_data['cost'], hist_data['actual_orders'], hist_data['recency_weight'], n_bootstrap
+                hist_data['cost'], hist_data[target_col], hist_data['recency_weight'], n_bootstrap
             )
         
-        total_mean_orders = np.average(hist_data['actual_orders'], weights=hist_data['recency_weight'])
+        total_mean_orders = np.average(hist_data[target_col], weights=hist_data['recency_weight'])
         total_mean_cost = np.average(hist_data['cost'], weights=hist_data['recency_weight'])
         
         if total_mean_orders > 0 and total_mean_cost > 0:
             # Non-brand is typically less elastic than total
-            nonbrand_elasticity = abs(total_cost_corr) * 0.15  # Lower multiplier for non-brand
+            # Adjust multiplier based on metric type
+            if metric_name == 'ncos':
+                nonbrand_elasticity = abs(total_cost_corr) * 0.08  # Lower multiplier for NCOS non-brand
+            else:
+                nonbrand_elasticity = abs(total_cost_corr) * 0.15  # Lower multiplier for orders non-brand
             elasticities['baseline_orders_per_nonbrand_dollar'] = total_mean_orders / total_mean_cost
             # Adjust confidence intervals for non-brand (lower than total cost)
             elasticities['nonbrand_elasticity_lower_ci'] = total_lower_ci_nb * 0.8
             elasticities['nonbrand_elasticity_upper_ci'] = total_upper_ci_nb * 0.8
         else:
+            if metric_name == 'ncos':
+                nonbrand_elasticity = 0.04
+                elasticities['baseline_orders_per_nonbrand_dollar'] = 0.005
+                elasticities['nonbrand_elasticity_lower_ci'] = 0.01
+                elasticities['nonbrand_elasticity_upper_ci'] = 0.08
+            else:
+                nonbrand_elasticity = 0.08
+                elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
+                elasticities['nonbrand_elasticity_lower_ci'] = 0.02
+                elasticities['nonbrand_elasticity_upper_ci'] = 0.15
+    else:
+        if metric_name == 'ncos':
+            nonbrand_elasticity = 0.04
+            elasticities['baseline_orders_per_nonbrand_dollar'] = 0.005
+            elasticities['nonbrand_elasticity_lower_ci'] = 0.01
+            elasticities['nonbrand_elasticity_upper_ci'] = 0.08
+        else:
             nonbrand_elasticity = 0.08
             elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
             elasticities['nonbrand_elasticity_lower_ci'] = 0.02
             elasticities['nonbrand_elasticity_upper_ci'] = 0.15
-    else:
-        nonbrand_elasticity = 0.08
-        elasticities['baseline_orders_per_nonbrand_dollar'] = 0.01
-        elasticities['nonbrand_elasticity_lower_ci'] = 0.02
-        elasticities['nonbrand_elasticity_upper_ci'] = 0.15
     
     # Calculate weighted brand share
     if 'brand_cost' in hist_data.columns and 'nonbrand_cost' in hist_data.columns:
@@ -1237,10 +1320,23 @@ def calculate_historical_elasticities(table, recency_days=14, decay_half_life=30
     avg_weight_recent = hist_data[hist_data['days_back'] <= recency_days]['recency_weight'].mean() if recent_data_points > 0 else 0
     avg_weight_old = hist_data[hist_data['days_back'] > decay_half_life]['recency_weight'].mean() if len(hist_data[hist_data['days_back'] > decay_half_life]) > 0 else 0
     
+    # Adjust elasticity caps based on metric type
+    if metric_name == 'ncos':
+        brand_cap_max = 0.25  # Lower cap for NCOS
+        nonbrand_cap_max = 0.15  # Lower cap for NCOS nonbrand
+        brand_cap_min = 0.02
+        nonbrand_cap_min = 0.01
+    else:
+        brand_cap_max = 0.35  # Standard cap for orders
+        nonbrand_cap_max = 0.25  # Standard cap for orders nonbrand
+        brand_cap_min = 0.05
+        nonbrand_cap_min = 0.02
+    
     elasticities.update({
-        'brand_elasticity': max(0.05, min(0.35, brand_elasticity)),  # Slightly higher cap due to recency focus
-        'nonbrand_elasticity': max(0.02, min(0.25, nonbrand_elasticity)),  # Slightly higher cap due to recency focus
+        'brand_elasticity': max(brand_cap_min, min(brand_cap_max, brand_elasticity)),
+        'nonbrand_elasticity': max(nonbrand_cap_min, min(nonbrand_cap_max, nonbrand_elasticity)),
         'brand_share': brand_share,
+        'metric_type': metric_name,
         'recency_weighted': True,
         'recent_data_points': recent_data_points,
         'avg_weight_recent': avg_weight_recent,
@@ -1375,24 +1471,40 @@ def calculate_incremental_impact(baseline_table, scenario_table, elasticities):
     
     return total_impact_factor, impact_details, total_impact_factor_lower, total_impact_factor_upper
 
-def generate_scenario_forecast(scenario_table, baseline_table=None):
+def generate_scenario_forecast(scenario_table, baseline_table=None, metric='orders'):
     """Generate new forecasts using elasticity-based modeling"""
     
+    # Determine the target column based on metric
+    if metric == 'ncos':
+        target_col = 'actual_ncos'
+    else:
+        target_col = 'actual_orders'
+    
     # Get future data from scenario table
-    future_data = scenario_table[scenario_table["actual_orders"].isna()].copy()
+    future_data = scenario_table[scenario_table[target_col].isna()].copy()
     
     if future_data.empty or baseline_table is None:
         return None, None, None, {}
     
-    # Calculate historical elasticities
-    elasticities = calculate_historical_elasticities(baseline_table)
+    # Calculate historical elasticities for the specified metric
+    elasticities = calculate_historical_elasticities(baseline_table, metric=metric)
     
     # Calculate incremental impact with diminishing returns and confidence intervals
     impact_factor, impact_details, impact_factor_lower, impact_factor_upper = calculate_incremental_impact(baseline_table, scenario_table, elasticities)
     
     # Apply impact to baseline forecasts - use baseline forecast as starting point
-    baseline_future = baseline_table[baseline_table["actual_orders"].isna()].copy()
+    baseline_future = baseline_table[baseline_table[target_col].isna()].copy()
     scenario_orders_fc = baseline_future[['ds']].copy()
+    
+    # Determine which forecast column to use based on metric
+    if metric == 'ncos':
+        forecast_col = 'ncos'
+        forecast_lower_col = 'ncos_lower'
+        forecast_upper_col = 'ncos_upper'
+    else:
+        forecast_col = 'orders'
+        forecast_lower_col = 'orders_lower'
+        forecast_upper_col = 'orders_upper'
     
     # Check for market condition adjustments
     market_impact_factor = 1.0
@@ -1410,31 +1522,31 @@ def generate_scenario_forecast(scenario_table, baseline_table=None):
     # Combine budget impact with market conditions
     total_impact_factor = impact_factor * market_impact_factor
     
-    if 'orders' in baseline_future.columns and len(baseline_future) > 0:
+    if forecast_col in baseline_future.columns and len(baseline_future) > 0:
         # Apply combined elasticity and market condition impact factors to baseline forecast
-        scenario_orders_fc['orders'] = baseline_future['orders'] * total_impact_factor
+        scenario_orders_fc[forecast_col] = baseline_future[forecast_col] * total_impact_factor
         
         # Add elasticity confidence intervals
-        scenario_orders_fc['orders_lower_elasticity'] = baseline_future['orders'] * impact_factor_lower
-        scenario_orders_fc['orders_upper_elasticity'] = baseline_future['orders'] * impact_factor_upper
+        scenario_orders_fc[f'{forecast_col}_lower_elasticity'] = baseline_future[forecast_col] * impact_factor_lower
+        scenario_orders_fc[f'{forecast_col}_upper_elasticity'] = baseline_future[forecast_col] * impact_factor_upper
         
         # Combine with baseline Prophet confidence intervals if they exist
-        if 'orders_upper' in baseline_future.columns and 'orders_lower' in baseline_future.columns:
+        if forecast_upper_col in baseline_future.columns and forecast_lower_col in baseline_future.columns:
             # Use wider of the two uncertainty sources
-            baseline_lower = baseline_future['orders_lower'] * impact_factor
-            baseline_upper = baseline_future['orders_upper'] * impact_factor
+            baseline_lower = baseline_future[forecast_lower_col] * impact_factor
+            baseline_upper = baseline_future[forecast_upper_col] * impact_factor
             
             # Take the most conservative (widest) bounds
-            scenario_orders_fc['orders_lower'] = np.minimum(baseline_lower, scenario_orders_fc['orders_lower_elasticity'])
-            scenario_orders_fc['orders_upper'] = np.maximum(baseline_upper, scenario_orders_fc['orders_upper_elasticity'])
+            scenario_orders_fc[forecast_lower_col] = np.minimum(baseline_lower, scenario_orders_fc[f'{forecast_col}_lower_elasticity'])
+            scenario_orders_fc[forecast_upper_col] = np.maximum(baseline_upper, scenario_orders_fc[f'{forecast_col}_upper_elasticity'])
         else:
             # Use only elasticity confidence intervals
-            scenario_orders_fc['orders_lower'] = scenario_orders_fc['orders_lower_elasticity']
-            scenario_orders_fc['orders_upper'] = scenario_orders_fc['orders_upper_elasticity']
+            scenario_orders_fc[forecast_lower_col] = scenario_orders_fc[f'{forecast_col}_lower_elasticity']
+            scenario_orders_fc[forecast_upper_col] = scenario_orders_fc[f'{forecast_col}_upper_elasticity']
     else:
-        scenario_orders_fc['orders'] = 0
-        scenario_orders_fc['orders_lower'] = 0
-        scenario_orders_fc['orders_upper'] = 0
+        scenario_orders_fc[forecast_col] = 0
+        scenario_orders_fc[forecast_lower_col] = 0
+        scenario_orders_fc[forecast_upper_col] = 0
     
     # Clicks and impressions respond differently - they're more directly tied to spend
     clicks_impact = (1 + (impact_factor - 1) * 0.9) * market_clicks_factor  # 90% of orders budget impact + market conditions
@@ -1464,10 +1576,8 @@ def generate_scenario_forecast(scenario_table, baseline_table=None):
     else:
         scenario_impr_fc['impressions'] = 0
     
+    # Return forecast results and summary metrics - dynamically based on metric type
     scenario_metrics = {
-        'total_orders': scenario_orders_fc['orders'].sum(),
-        'total_orders_lower': scenario_orders_fc['orders_lower'].sum() if 'orders_lower' in scenario_orders_fc.columns else 0,
-        'total_orders_upper': scenario_orders_fc['orders_upper'].sum() if 'orders_upper' in scenario_orders_fc.columns else 0,
         'impact_factor': impact_factor,
         'impact_factor_lower': impact_factor_lower,
         'impact_factor_upper': impact_factor_upper,
@@ -1475,28 +1585,49 @@ def generate_scenario_forecast(scenario_table, baseline_table=None):
         'impact_details': impact_details
     }
     
+    # Add metric-specific totals
+    if metric == 'ncos' and 'ncos' in scenario_orders_fc.columns:
+        scenario_metrics.update({
+            'total_ncos': scenario_orders_fc['ncos'].sum(),
+            'total_ncos_lower': scenario_orders_fc['ncos_lower'].sum() if 'ncos_lower' in scenario_orders_fc.columns else scenario_orders_fc['ncos'].sum(),
+            'total_ncos_upper': scenario_orders_fc['ncos_upper'].sum() if 'ncos_upper' in scenario_orders_fc.columns else scenario_orders_fc['ncos'].sum(),
+        })
+    else:
+        scenario_metrics.update({
+            'total_orders': scenario_orders_fc['orders'].sum() if 'orders' in scenario_orders_fc.columns else 0,
+            'total_orders_lower': scenario_orders_fc['orders_lower'].sum() if 'orders_lower' in scenario_orders_fc.columns else 0,
+            'total_orders_upper': scenario_orders_fc['orders_upper'].sum() if 'orders_upper' in scenario_orders_fc.columns else 0,
+        })
+    
     return scenario_orders_fc, scenario_clicks_fc, scenario_impr_fc, scenario_metrics
 
-def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_orders_fc, scenario_orders_fc):
+def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_orders_fc, scenario_orders_fc, metric_name="orders"):
     """Create comparison chart between baseline and scenario forecasts"""
     fig = go.Figure()
     
     # Historical data (same for both)
-    hist_data = baseline_table[baseline_table["actual_orders"].notna()]
+    actual_col = f"actual_{metric_name}"
+    hist_data = baseline_table[baseline_table[actual_col].notna()] if actual_col in baseline_table.columns else baseline_table[baseline_table["actual_orders"].notna()]
+    
     if not hist_data.empty:
+        historical_values = hist_data[actual_col] if actual_col in hist_data.columns else hist_data["actual_orders"]
+        metric_display = metric_name.upper() if metric_name == "ncos" else metric_name.title()
+        
         fig.add_trace(go.Scatter(
             x=hist_data["ds"],
-            y=hist_data["actual_orders"],
+            y=historical_values,
             mode='lines+markers',
-            name='Historical Orders',
+            name=f'Historical {metric_display}',
             line=dict(color='black', width=2)
         ))
     
     # Baseline forecast
     if baseline_orders_fc is not None and not baseline_orders_fc.empty:
+        forecast_col = metric_name if metric_name in baseline_orders_fc.columns else "orders"
+        
         fig.add_trace(go.Scatter(
             x=baseline_orders_fc["ds"],
-            y=baseline_orders_fc["orders"],
+            y=baseline_orders_fc[forecast_col],
             mode='lines+markers',
             name='Baseline Forecast',
             line=dict(color='blue', width=2)
@@ -1504,19 +1635,24 @@ def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_or
     
     # Scenario forecast
     if scenario_orders_fc is not None and not scenario_orders_fc.empty:
+        # Use the appropriate column based on metric type
+        scenario_col = metric_name if metric_name in scenario_orders_fc.columns else "orders"
+        
         fig.add_trace(go.Scatter(
             x=scenario_orders_fc["ds"],
-            y=scenario_orders_fc["orders"],
+            y=scenario_orders_fc[scenario_col],
             mode='lines+markers',
             name='Scenario Forecast',
             line=dict(color='red', width=2, dash='dash')
         ))
         
         # Add confidence intervals for scenario forecast if available
-        if 'orders_upper' in scenario_orders_fc.columns and 'orders_lower' in scenario_orders_fc.columns:
+        upper_col = f"{scenario_col}_upper"
+        lower_col = f"{scenario_col}_lower"
+        if upper_col in scenario_orders_fc.columns and lower_col in scenario_orders_fc.columns:
             fig.add_trace(go.Scatter(
                 x=scenario_orders_fc["ds"],
-                y=scenario_orders_fc["orders_upper"],
+                y=scenario_orders_fc[upper_col],
                 mode='lines',
                 name='Scenario Upper CI',
                 line=dict(width=0),
@@ -1525,7 +1661,7 @@ def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_or
             
             fig.add_trace(go.Scatter(
                 x=scenario_orders_fc["ds"],
-                y=scenario_orders_fc["orders_lower"],
+                y=scenario_orders_fc[lower_col],
                 mode='lines',
                 name='Scenario 90% CI',
                 fill='tonexty',
@@ -1533,10 +1669,13 @@ def create_scenario_comparison_chart(baseline_table, scenario_table, baseline_or
                 line=dict(width=0)
             ))
     
+    # Dynamic title and labels based on metric
+    metric_display = metric_name.upper() if metric_name == "ncos" else metric_name.title()
+    
     fig.update_layout(
-        title="Baseline vs Scenario Forecast Comparison",
+        title=f"Baseline vs Scenario Forecast Comparison - {metric_display}",
         xaxis_title="Date",
-        yaxis_title="Orders",
+        yaxis_title=metric_display,
         hovermode='x unified',
         legend=dict(
             orientation="h",
@@ -1913,6 +2052,14 @@ if uploaded_file is not None:
             with tab4:
                 st.header("🔮 Scenario Planning")
                 
+                # Metric selector for scenario planning
+                scenario_metric_option = st.radio(
+                    "Select metric for scenario analysis:",
+                    options=["Orders", "NCOS (New Customer Orders)"],
+                    horizontal=True,
+                    key="scenario_metric_selector"
+                )
+                
                 st.markdown("**What-if Analysis**: Adjust budget scenarios to see forecast impact")
                 
                 with st.expander("📖 Methodology"):
@@ -2028,17 +2175,35 @@ if uploaded_file is not None:
                         scenario_table = apply_market_conditions(scenario_table, economic_condition, competitive_pressure, industry_trend)
                     
                     # Generate scenario forecasts - pass baseline table for comparison
-                    scenario_orders_fc, scenario_clicks_fc, scenario_impr_fc, scenario_metrics = generate_scenario_forecast(
-                        scenario_table, table
-                    )
+                    # Determine metric based on selected option
+                    if scenario_metric_option == "NCOS (New Customer Orders)":
+                        scenario_metric = 'ncos'
+                    else:
+                        scenario_metric = 'orders'
                     
+                    scenario_orders_fc, scenario_clicks_fc, scenario_impr_fc, scenario_metrics = generate_scenario_forecast(
+                        scenario_table, table, metric=scenario_metric
+                    )
                     
                     # Display scenario comparison
                     st.subheader("📊 Scenario vs Baseline Comparison")
                     
+                    # Select baseline forecast based on metric choice
+                    if scenario_metric_option == "Orders":
+                        baseline_fc = orders_fc
+                        baseline_metric_col = "orders"
+                        scenario_fc = scenario_orders_fc
+                        chart_title_suffix = "Orders"
+                    else:  # NCOS
+                        baseline_fc = ncos_fc
+                        baseline_metric_col = "ncos"
+                        # Use the NCOS-specific scenario forecast
+                        scenario_fc = scenario_orders_fc  # The function now generates NCOS-appropriate forecasts when metric='ncos'
+                        chart_title_suffix = "NCOS (New Customer Orders)"
+                    
                     # Create comparison chart
                     scenario_comparison_chart = create_scenario_comparison_chart(
-                        table, scenario_table, orders_fc, scenario_orders_fc
+                        table, scenario_table, baseline_fc, scenario_fc, metric_name=baseline_metric_col
                     )
                     st.plotly_chart(scenario_comparison_chart, use_container_width=True)
                     
@@ -2046,18 +2211,32 @@ if uploaded_file is not None:
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        baseline_total = orders_fc['orders'].sum() if orders_fc is not None else 0
-                        scenario_total = scenario_orders_fc['orders'].sum() if scenario_orders_fc is not None else 0
+                        # Use dynamic baseline and scenario totals based on selected metric
+                        baseline_total = baseline_fc[baseline_metric_col].sum() if baseline_fc is not None else 0
+                        
+                        # Use the appropriate forecast column based on selected metric
+                        if scenario_metric_option == "Orders":
+                            scenario_total = scenario_orders_fc['orders'].sum() if scenario_orders_fc is not None else 0
+                        else:  # NCOS - use NCOS forecast column
+                            scenario_total = scenario_orders_fc['ncos'].sum() if scenario_orders_fc is not None and 'ncos' in scenario_orders_fc.columns else 0
+                            
                         impact = scenario_total - baseline_total
                         
-                        # Get confidence interval for orders impact
-                        scenario_lower = scenario_metrics.get('total_orders_lower', scenario_total)
-                        scenario_upper = scenario_metrics.get('total_orders_upper', scenario_total)
+                        # Get confidence interval based on selected metric
+                        if scenario_metric_option == "Orders":
+                            scenario_lower = scenario_metrics.get('total_orders_lower', scenario_total)
+                            scenario_upper = scenario_metrics.get('total_orders_upper', scenario_total)
+                        else:  # NCOS
+                            scenario_lower = scenario_metrics.get('total_ncos_lower', scenario_total)
+                            scenario_upper = scenario_metrics.get('total_ncos_upper', scenario_total)
                         impact_lower = scenario_lower - baseline_total
                         impact_upper = scenario_upper - baseline_total
                         
+                        # Dynamic metric label
+                        impact_label = f"{chart_title_suffix} Impact"
+                        
                         st.metric(
-                            "Orders Impact", 
+                            impact_label, 
                             f"{impact:+,.0f}",
                             delta=f"{(impact/baseline_total*100):+.1f}%" if baseline_total > 0 else "N/A"
                         )
